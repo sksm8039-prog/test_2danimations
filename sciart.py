@@ -193,7 +193,7 @@ def make_rocket(legs=False):
                         outline=(140, 148, 166, 255), width=2 * S)
     d.ellipse(R_(cx + 12, 402, cx + 18, 408), fill=(90, 98, 116, 255))
     d.rectangle(R_(cx - 30, 482, cx + 30, 492), fill=(50, 54, 66, 255))
-    return im.resize((w, h), Image.LANCZOS)
+    return im.resize((max(w,1), max(1, h)), Image.LANCZOS)
 
 
 EARTH = make_earth()
@@ -210,7 +210,7 @@ def make_cap():
     x0, x1 = c - 540 / k, c + 540 / k
     y0 = (c - R) - 60 / k
     y1 = y0 + 720 / k
-    return EARTH.crop((int(x0), int(y0), int(x1) + 1, int(y1) + 1)).resize((W, 720), Image.BICUBIC)
+    return EARTH.crop((int(x0), int(y0), int(x1) + 1, int(y1) + 1)).resize((max(1,W), 720), Image.BICUBIC)
 
 
 EARTH_CAP, CAP_TOP = make_cap(), 60
@@ -255,7 +255,7 @@ def rocket_layer(sprite, flame_len, wscale, rng, angle, scale):
         rig.alpha_composite(fl.filter(ImageFilter.GaussianBlur(2.5)))
     rig.alpha_composite(sprite, (0, 470))
     if scale != 1:
-        rig = rig.resize((int(360 * scale), int(1500 * scale)), Image.BILINEAR)
+        rig = rig.resize((max(1,int(360 * scale)), max(1,int(1500 * scale))), Image.BILINEAR)
     if abs(angle) > 0.05:
         rig = rig.rotate(-angle, resample=Image.BICUBIC, expand=True)
     return rig
@@ -315,7 +315,7 @@ def make_satellite():
     d.pieslice(R_(cx - 44, cy - 112, cx + 44, cy - 56), 180, 360, fill=(226, 229, 237, 255),
                outline=(150, 156, 170, 255), width=2 * S)
     d.ellipse(R_(cx - 5, cy - 90, cx + 5, cy - 80), fill=(230, 70, 70, 255))
-    return im.resize((w, h), Image.LANCZOS)
+    return im.resize((max(1,w), max(1,h)), Image.LANCZOS)
 
 
 SATELLITE = make_satellite()
@@ -563,7 +563,7 @@ def _tortoise_layer(phase, mood, blink, bob):
         d.pieslice(E(hx + 6, hy + 12, hx + 24, hy + 28), 0, 180, fill=(240, 120, 130, 255))
     else:
         d.arc(E(hx - 4, hy - 4, hx + 30, hy + 18), 20, 160, fill=(60, 40, 30, 255), width=3 * S)
-    return im.resize((w, h), Image.LANCZOS)
+    return im.resize((max(1,w), max(1,h)), Image.LANCZOS)
 
 
 def draw_tortoise(img, x, y, scale=1.0, phase=0.0, mood="walk", facing=1, t=0.0):
@@ -616,7 +616,7 @@ def _hare_layer(pose, phase, t, crouch):
         d.arc(E(hx + 2, hy - 14, hx + 26, hy + 4), 20, 160, fill=dark, width=3 * S)
         ear(hx - 14, hy - 24, -100)
         ear(hx + 4, hy - 28, -94)
-        return im.resize((w, h), Image.LANCZOS)
+        return im.resize((max(1,w), max(1,h)), Image.LANCZOS)
 
     th = 2 * math.pi * phase
     run, walk = pose == "run", pose == "walk"
@@ -698,7 +698,7 @@ def _hare_layer(pose, phase, t, crouch):
         a2 = 4 * (1 - crouch) - 54 * crouch - flutter
     ear(hx - 14, hy - 28, a1)
     ear(hx + 6, hy - 32, a2)
-    return im.resize((w, h), Image.LANCZOS)
+    return im.resize((max(1,w), max(1,h)), Image.LANCZOS)
 
 
 def draw_hare(img, x, y, scale=1.0, pose="stand", phase=0.0, facing=1, t=0.0, crouch=0.0):
@@ -732,7 +732,7 @@ def draw_trophy(img, x, y, scale=1.0, t=0.0):
     d.polygon(pts, fill=(255, 250, 220, 255))
     im = im.resize((w, h), Image.LANCZOS)
     if scale != 1:
-        im = im.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+        im = im.resize((max(1,int(w * scale)), max(1,int(h * scale))), Image.LANCZOS)
     paste_center(img, im, x, y)
     d2 = ImageDraw.Draw(img, "RGBA")
     for k, (sx_, sy_) in enumerate(((-70, -60), (76, -40), (-50, 50), (68, 62))):
