@@ -340,7 +340,7 @@ def phase_launch(t, fi):
     if gy < H + 60:
         for x, hgt in MOUNTS:
             d.polygon([(x - 90, gy), (x, gy - hgt), (x + 90, gy)], fill=(88, 130, 150, 255))
-        d.rectangle([0, gy, W, H], fill=(72, 112, 62, 255))
+        d.rectangle([0, gy, W, max(H, gy)], fill=(72, 112, 62, 255))
         d.rectangle([0, gy, W, gy + 14], fill=(88, 130, 74, 255))
         tx = 250
         d.rectangle([tx, gy - 560, tx + 46, gy], outline=(90, 96, 108, 255), width=5)
