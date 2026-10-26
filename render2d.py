@@ -2,13 +2,14 @@
 """
 render2d.py - 2D rocket mission animation (Pillow + NumPy + ffmpeg only)
 
-Story (30 s, 1080x1920 vertical, 30 fps):
-  1. LAUNCH   0.0 -  9.0  ignition on the pad, lift-off, climb through the
-                          atmosphere (clouds, speed lines), blue sky -> space
-  2. TRANSIT  9.0 - 16.5  engine burn, coast, Earth shrinks behind, Moon grows
-  3. LANDING 16.5 - 23.0  retro-burn, legs out, dust, soft touchdown
-  4. HATCH   23.0 - 30.0  close-up: hatch unlatches, swings open, light spills
-                          out, ladder extends, astronaut waves
+Story (42.5 s, 1080x1920 vertical, 30 fps):
+  1. LAUNCH       0.0 -  9.0  ignition, lift-off, climb through the atmosphere
+  2. EARTH ORBIT  9.0 - 15.0  one full revolution around Earth (behind/in front)
+  3. TRANSIT     15.0 - 23.0  trans-lunar burn, rocket shrinks as it leaves
+                              Earth, Moon grows ahead
+  4. MOON ORBIT  23.0 - 29.0  lunar orbit insertion, one revolution, de-orbit burn
+  5. LANDING     29.0 - 35.5  retro-burn, legs out, dust, soft touchdown
+  6. HATCH       35.5 - 42.5  hatch opens, light spills out, ladder, astronaut waves
 
 No posting, no network, no API keys. Pure local rendering.
 
@@ -39,9 +40,11 @@ XFADE = 0.6  # seconds of dissolve between phases
 
 PHASES = [
     ("launch", 0.0, 9.0),
-    ("transit", 9.0, 16.5),
-    ("landing", 16.5, 23.0),
-    ("hatch", 23.0, 30.0),
+    ("orbit_earth", 9.0, 15.0),
+    ("transit", 15.0, 23.0),
+    ("orbit_moon", 23.0, 29.0),
+    ("landing", 29.0, 35.5),
+    ("hatch", 35.5, 42.5),
 ]
 TOTAL = PHASES[-1][2]
 
@@ -394,39 +397,109 @@ def phase_launch(t, fi):
     return img
 
 
-# ------------------------------------------------------------ phase 2: transit
+# ------------------------------------------------- phases 2-4: orbit / transit
+def draw_orbit(img, t, dur, planet, native_r, pr, center, burn_len, rng):
+    """One full revolution around a planet. Rocket passes behind it, then in front,
+    and looks bigger when nearer the camera."""
+    cx, cy = center
+    rx, ry = 1.3 * pr, 0.42 * pr
+
+    def pt(a):
+        return (cx + rx * math.cos(a), cy + ry * math.sin(a))
+
+    th = math.pi + 2 * math.pi * clamp(t / dur)  # starts at the left, heading up
+    s = math.sin(th)
+    pos = pt(th)
+    scale = 0.36 * (1 + 0.28 * s)
+    ang = math.degrees(math.atan2(-rx * math.sin(th), -(ry * math.cos(th))))
+    layer = rocket_layer(ROCKET, burn_len, 1.9, rng, ang, scale)
+    d = ImageDraw.Draw(img, "RGBA")
+
+    def dots(front):
+        for i in range(90):
+            a = 2 * math.pi * i / 90
+            if (math.sin(a) >= 0) == front:
+                x, y = pt(a)
+                d.ellipse([x - 2, y - 2, x + 2, y + 2], fill=(255, 255, 255, 70))
+
+    dots(False)
+    if s < 0:
+        paste_center(img, layer, *pos)
+    paste_center(img, scaled(planet, pr / native_r), cx, cy)
+    dots(True)
+    if s >= 0:
+        paste_center(img, layer, *pos)
+
+
+def phase_orbit_earth(t, fi):
+    rng = random.Random(fi)
+    img = vgrad((2, 3, 12), (10, 14, 34))
+    draw_stars(img, 1.0, t, dx=-t * 6, dy=t * 4)
+    paste_center(img, scaled(MOON, 0.07), 900, 250)  # the distant Moon
+    burn = 300 * clamp(1 - t / 0.8)  # orbit-insertion burn
+    draw_orbit(img, t, 6.0, EARTH, 380, 330, (540, 1050), burn, rng)
+    return img
+
+
+BEZ = [(128, 1050), (128, 760), (330, 640), (520, 560)]
+
+
+def bez(p):
+    q = 1 - p
+    return tuple(q ** 3 * BEZ[0][i] + 3 * q * q * p * BEZ[1][i] + 3 * q * p * p * BEZ[2][i] + p ** 3 * BEZ[3][i]
+                 for i in (0, 1))
+
+
+def bez_d(p):
+    q = 1 - p
+    return tuple(3 * (q * q * (BEZ[1][i] - BEZ[0][i]) + 2 * q * p * (BEZ[2][i] - BEZ[1][i])
+                      + p * p * (BEZ[3][i] - BEZ[2][i])) for i in (0, 1))
+
+
 def phase_transit(t, fi):
     rng = random.Random(fi)
-    u = clamp(t / 7.5)
+    u = clamp(t / 8.0)
     su = smooth(u)
     img = vgrad((2, 3, 12), (10, 14, 34))
     draw_stars(img, 1.0, t, dx=-t * 9, dy=t * 14)
 
-    er = lerp(900, 160, su)
-    ec = (lerp(540, 165, su), lerp(2490, 1730, su))
-    paste_center(img, scaled(EARTH, er / 380), *ec)
+    er = lerp(330, 130, su)
+    paste_center(img, scaled(EARTH, er / 380), lerp(540, 190, su), lerp(1050, 1660, su))
+    mr = lerp(24, 260, u ** 2.0)
+    paste_center(img, scaled(MOON, mr / 300), lerp(880, 790, su), lerp(300, 470, su))
 
-    mr = lerp(45, 330, u ** 2.2)
-    mc = (lerp(850, 740, su), lerp(360, 430, su))
-    paste_center(img, scaled(MOON, mr / 300), *mc)
-
-    px, py = lerp(540, 600, su), lerp(900, 790, su)
-    scale = lerp(1.0, 0.55, su)
-    aim = math.degrees(math.atan2(mc[0] - px, py - mc[1]))
-    angle = aim * smooth(t / 2.5)
+    p = smooth(clamp((t - 0.3) / 7.4))
+    px, py = bez(p)
+    dx, dy = bez_d(p)
+    ang = math.degrees(math.atan2(dx, -dy))
+    scale = lerp(0.36, 0.14, p)  # shrinks as it gets farther from Earth
 
     d = ImageDraw.Draw(img, "RGBA")
-    if t > 2.0:
-        dist = math.hypot(mc[0] - px, mc[1] - py)
-        for i in range(1, 16):
-            f = i / 16
-            x, y = lerp(px, mc[0], f), lerp(py, mc[1], f)
-            if math.hypot(mc[0] - x, mc[1] - y) > mr + 25:
-                d.ellipse([x - 3, y - 3, x + 3, y + 3], fill=(255, 255, 255, int(90 * smooth((t - 2.0) / 1.0))))
+    for i in range(61):
+        q = i / 60
+        x, y = bez(q)
+        if q < p:
+            d.ellipse([x - 2.5, y - 2.5, x + 2.5, y + 2.5], fill=(255, 210, 140, 110))
+        else:
+            d.ellipse([x - 2, y - 2, x + 2, y + 2], fill=(255, 255, 255, 45))
 
-    burn = 1.0 if t < 1.0 else clamp(1 - (t - 1.0) / 0.6)
-    layer = rocket_layer(ROCKET, 300 * burn, 1.9, rng, angle, scale)
-    paste_center(img, layer, px, py)
+    burn = 300 * clamp(1 - (t - 0.6) / 1.0)  # trans-lunar injection burn
+    paste_center(img, rocket_layer(ROCKET, burn, 1.9, rng, ang, scale), px, py)
+    return img
+
+
+def phase_orbit_moon(t, fi):
+    rng = random.Random(fi)
+    img = vgrad((1, 2, 8), (10, 12, 26))
+    draw_stars(img, 1.0, t, dx=-t * 5, dy=t * 3)
+    paste_center(img, scaled(EARTH, 0.17), 160, 330)  # Earth, far behind
+    if t < 0.9:
+        burn = 300 * clamp(1 - t / 0.9)  # lunar orbit insertion burn
+    elif t > 5.0:
+        burn = 240 * smooth((t - 5.0) / 0.3)  # de-orbit burn
+    else:
+        burn = 0.0
+    draw_orbit(img, t, 6.0, MOON, 300, 330, (540, 1000), burn, rng)
     return img
 
 
@@ -694,7 +767,7 @@ def phase_hatch(t, fi):
     return img
 
 
-PHASE_FUNCS = [phase_launch, phase_transit, phase_landing, phase_hatch]
+PHASE_FUNCS = [phase_launch, phase_orbit_earth, phase_transit, phase_orbit_moon, phase_landing, phase_hatch]
 
 
 # ------------------------------------------------------------------ main loop
