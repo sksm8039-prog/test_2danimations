@@ -496,7 +496,7 @@ def draw_bubble(img, x, y, text, size=46, tail=None, alpha=1.0):
 # -------------------------------------------------------------- characters
 def _blit_char(img, layer, ax, ay, x, y, scale, facing):
     if scale != 1:
-        layer = layer.resize((int(layer.width * scale), int(layer.height * scale)), Image.LANCZOS)
+        layer = layer.resize((max(1,int(layer.width * scale)), max(1,int(layer.height * scale))), Image.LANCZOS)
         ax, ay = ax * scale, ay * scale
     if facing < 0:
         layer = ImageOps.mirror(layer)
@@ -730,7 +730,7 @@ def draw_trophy(img, x, y, scale=1.0, t=0.0):
         a = math.radians(-90 + 36 * k)
         pts.append(((100 + r * math.cos(a)) * S, (76 + r * math.sin(a)) * S))
     d.polygon(pts, fill=(255, 250, 220, 255))
-    im = im.resize((w, h), Image.LANCZOS)
+    im = im.resize((max(1,w), max(1,h)), Image.LANCZOS)
     if scale != 1:
         im = im.resize((max(1,int(w * scale)), max(1,int(h * scale))), Image.LANCZOS)
     paste_center(img, im, x, y)
