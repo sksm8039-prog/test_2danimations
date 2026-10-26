@@ -1,0 +1,67 @@
+name: Render test
+
+# Manual trigger only: no schedule, no push trigger, no secrets, no posting.
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "preview = 5 PNG stills (about 1 min), full = 30 s mp4"
+        type: choice
+        options:
+          - preview
+          - full
+        default: preview
+      fps:
+        description: "Frame rate for full mode (15 = fast test, 30 = final)"
+        type: choice
+        options:
+          - "15"
+          - "30"
+        default: "15"
+
+permissions:
+  contents: read
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+          pip install -r requirements.txt
+
+      - name: Render
+        shell: bash
+        env:
+          MODE: ${{ inputs.mode }}
+          FPS: ${{ inputs.fps }}
+        run: |
+          mkdir -p out
+          if [ "$MODE" = "preview" ]; then
+            python render2d.py --out out/preview.mp4 --still 2,8,14,20,26 | tee render.log
+          else
+            python render2d.py --out out/rocket_mission.mp4 --fps "$FPS" | tee render.log
+          fi
+          {
+            echo "### Render log ($MODE)"
+            echo '```'
+            tail -12 render.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: render2d-output
+          path: out/
+          if-no-files-found: error
+          retention-days: 3
