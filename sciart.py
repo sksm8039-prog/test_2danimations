@@ -4,7 +4,7 @@ sciart.py - tiny procedural 2D art library for science videos (Pillow + NumPy on
 
 Everything is drawn in code: no downloads, no licences, no network.
 Objects:  draw_earth, draw_moon, draw_rocket, draw_satellite, draw_atom, draw_dna,
-          draw_trophy, draw_tortoise, draw_hare
+          draw_trophy, draw_tortoise, draw_hare, draw_astronaut, draw_flag
 Text:     get_font, draw_text, draw_caption, draw_bubble
 CLI:      run_cli (shared --still / --start / --end / --frames-dir runner)
 Helpers:  vgrad, draw_stars, paste_center, scaled, rocket_layer, easing (clamp/lerp/smooth)
@@ -193,7 +193,7 @@ def make_rocket(legs=False):
                         outline=(140, 148, 166, 255), width=2 * S)
     d.ellipse(R_(cx + 12, 402, cx + 18, 408), fill=(90, 98, 116, 255))
     d.rectangle(R_(cx - 30, 482, cx + 30, 492), fill=(50, 54, 66, 255))
-    return im.resize((max(w,1), max(1, h)), Image.LANCZOS)
+    return im.resize((w, h), Image.LANCZOS)
 
 
 EARTH = make_earth()
@@ -210,7 +210,7 @@ def make_cap():
     x0, x1 = c - 540 / k, c + 540 / k
     y0 = (c - R) - 60 / k
     y1 = y0 + 720 / k
-    return EARTH.crop((int(x0), int(y0), int(x1) + 1, int(y1) + 1)).resize((max(1,W), 720), Image.BICUBIC)
+    return EARTH.crop((int(x0), int(y0), int(x1) + 1, int(y1) + 1)).resize((W, 720), Image.BICUBIC)
 
 
 EARTH_CAP, CAP_TOP = make_cap(), 60
@@ -255,7 +255,7 @@ def rocket_layer(sprite, flame_len, wscale, rng, angle, scale):
         rig.alpha_composite(fl.filter(ImageFilter.GaussianBlur(2.5)))
     rig.alpha_composite(sprite, (0, 470))
     if scale != 1:
-        rig = rig.resize((max(1,int(360 * scale)), max(1,int(1500 * scale))), Image.BILINEAR)
+        rig = rig.resize((int(360 * scale), int(1500 * scale)), Image.BILINEAR)
     if abs(angle) > 0.05:
         rig = rig.rotate(-angle, resample=Image.BICUBIC, expand=True)
     return rig
@@ -315,7 +315,7 @@ def make_satellite():
     d.pieslice(R_(cx - 44, cy - 112, cx + 44, cy - 56), 180, 360, fill=(226, 229, 237, 255),
                outline=(150, 156, 170, 255), width=2 * S)
     d.ellipse(R_(cx - 5, cy - 90, cx + 5, cy - 80), fill=(230, 70, 70, 255))
-    return im.resize((max(1,w), max(1,h)), Image.LANCZOS)
+    return im.resize((w, h), Image.LANCZOS)
 
 
 SATELLITE = make_satellite()
@@ -496,7 +496,7 @@ def draw_bubble(img, x, y, text, size=46, tail=None, alpha=1.0):
 # -------------------------------------------------------------- characters
 def _blit_char(img, layer, ax, ay, x, y, scale, facing):
     if scale != 1:
-        layer = layer.resize((max(1,int(layer.width * scale)), max(1,int(layer.height * scale))), Image.LANCZOS)
+        layer = layer.resize((int(layer.width * scale), int(layer.height * scale)), Image.LANCZOS)
         ax, ay = ax * scale, ay * scale
     if facing < 0:
         layer = ImageOps.mirror(layer)
@@ -563,7 +563,7 @@ def _tortoise_layer(phase, mood, blink, bob):
         d.pieslice(E(hx + 6, hy + 12, hx + 24, hy + 28), 0, 180, fill=(240, 120, 130, 255))
     else:
         d.arc(E(hx - 4, hy - 4, hx + 30, hy + 18), 20, 160, fill=(60, 40, 30, 255), width=3 * S)
-    return im.resize((max(1,w), max(1,h)), Image.LANCZOS)
+    return im.resize((w, h), Image.LANCZOS)
 
 
 def draw_tortoise(img, x, y, scale=1.0, phase=0.0, mood="walk", facing=1, t=0.0):
@@ -616,7 +616,7 @@ def _hare_layer(pose, phase, t, crouch):
         d.arc(E(hx + 2, hy - 14, hx + 26, hy + 4), 20, 160, fill=dark, width=3 * S)
         ear(hx - 14, hy - 24, -100)
         ear(hx + 4, hy - 28, -94)
-        return im.resize((max(1,w), max(1,h)), Image.LANCZOS)
+        return im.resize((w, h), Image.LANCZOS)
 
     th = 2 * math.pi * phase
     run, walk = pose == "run", pose == "walk"
@@ -698,7 +698,7 @@ def _hare_layer(pose, phase, t, crouch):
         a2 = 4 * (1 - crouch) - 54 * crouch - flutter
     ear(hx - 14, hy - 28, a1)
     ear(hx + 6, hy - 32, a2)
-    return im.resize((max(1,w), max(1,h)), Image.LANCZOS)
+    return im.resize((w, h), Image.LANCZOS)
 
 
 def draw_hare(img, x, y, scale=1.0, pose="stand", phase=0.0, facing=1, t=0.0, crouch=0.0):
@@ -730,9 +730,9 @@ def draw_trophy(img, x, y, scale=1.0, t=0.0):
         a = math.radians(-90 + 36 * k)
         pts.append(((100 + r * math.cos(a)) * S, (76 + r * math.sin(a)) * S))
     d.polygon(pts, fill=(255, 250, 220, 255))
-    im = im.resize((max(1,w), max(1,h)), Image.LANCZOS)
+    im = im.resize((w, h), Image.LANCZOS)
     if scale != 1:
-        im = im.resize((max(1,int(w * scale)), max(1,int(h * scale))), Image.LANCZOS)
+        im = im.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
     paste_center(img, im, x, y)
     d2 = ImageDraw.Draw(img, "RGBA")
     for k, (sx_, sy_) in enumerate(((-70, -60), (76, -40), (-50, 50), (68, 62))):
@@ -742,6 +742,113 @@ def draw_trophy(img, x, y, scale=1.0, t=0.0):
         c = (255, 255, 230, int(220 * a))
         d2.polygon([(px, py - r), (px + r * 0.25, py - r * 0.25), (px + r, py), (px + r * 0.25, py + r * 0.25),
                     (px, py + r), (px - r * 0.25, py + r * 0.25), (px - r, py), (px - r * 0.25, py - r * 0.25)], fill=c)
+
+
+def _astronaut_layer(pose, phase, t):
+    S = 2
+    w, h = 320, 440
+    ox, oy = 160, 410
+    im = Image.new("RGBA", (w * S, h * S), (0, 0, 0, 0))
+    d = ImageDraw.Draw(im)
+
+    def E(x0, y0, x1, y1):
+        return [x0 * S, y0 * S, x1 * S, y1 * S]
+
+    def LN(pts, col, wd):
+        d.line([(x * S, y * S) for x, y in pts], fill=col, width=int(wd * S), joint="curve")
+
+    suit, suit_d = (240, 242, 248, 255), (206, 211, 225, 255)
+    gray, dark = (150, 156, 172, 255), (40, 46, 66, 255)
+    th = 2 * math.pi * phase
+    walk, climb = pose == "walk", pose == "descend"
+    bob = 16 * abs(math.sin(th)) if walk else 0.0
+    hx_, hy_ = ox - 2, oy - 148 - bob
+
+    if walk:
+        fa = (ox + 62 * math.sin(th), oy - 32 * max(0.0, math.cos(th)))
+        fb = (ox + 62 * math.sin(th + math.pi), oy - 32 * max(0.0, math.cos(th + math.pi)))
+    elif climb:
+        fa = (ox + 34, oy - 10 - 80 * max(0.0, math.sin(th)))
+        fb = (ox + 24, oy - 10 - 80 * max(0.0, -math.sin(th)))
+    else:
+        fa, fb = (ox + 30, oy), (ox - 22, oy)
+
+    def leg(f, col):
+        ankle = (f[0] + 8, f[1] - 24)
+        mid = ((hx_ + ankle[0]) / 2 + 12, (hy_ + ankle[1]) / 2)
+        LN([(hx_, hy_), mid, ankle], (150, 156, 176, 255), 46)
+        LN([(hx_, hy_), mid, ankle], col, 38)
+        d.rounded_rectangle(E(f[0] - 24, f[1] - 26, f[0] + 42, f[1]), radius=10 * S, fill=(226, 230, 240, 255))
+        d.rectangle(E(f[0] - 24, f[1] - 8, f[0] + 42, f[1]), fill=dark)
+
+    def arm(sh, a1, a2, col):
+        v1 = rot((0, 58), -a1)
+        el = (sh[0] + v1[0], sh[1] + v1[1])
+        v2 = rot((0, 54), -(a1 + a2))
+        hand = (el[0] + v2[0], el[1] + v2[1])
+        LN([sh, el, hand], (150, 156, 176, 255), 42)
+        LN([sh, el, hand], col, 35)
+        d.ellipse(E(hand[0] - 20, hand[1] - 20, hand[0] + 20, hand[1] + 20), fill=gray)
+
+    sh = (ox + 4, hy_ - 118)
+    swing = 30 * math.sin(th)
+    if walk:
+        far, near = (-swing, 14), (swing, 14)
+    elif climb:
+        far, near = (140 + 10 * max(0.0, -math.sin(th)), -10), (150 + 10 * max(0.0, math.sin(th)), -20)
+    elif pose == "wave":
+        far, near = (6, 10), (128, 26 + 26 * math.sin(t * 6))
+    elif pose == "plant":
+        far, near = (72, 18), (78, 12)
+    else:
+        far, near = (8, 12), (-6, 10)
+
+    arm(sh, far[0], far[1], suit_d)
+    leg(fb, suit_d)
+    d.rounded_rectangle(E(ox - 96, hy_ - 132, ox - 40, hy_ - 20), radius=14 * S, fill=(198, 204, 220, 255),
+                        outline=(160, 166, 184, 255))
+    LN([(ox - 70, hy_ - 20), (ox - 70, hy_ + 16), (ox - 30, hy_ + 16)], gray, 6)
+    leg(fa, suit)
+    d.rounded_rectangle(E(ox - 52, hy_ - 142, ox + 52, hy_ + 12), radius=36 * S, fill=suit, outline=suit_d)
+    d.rectangle(E(ox + 8, hy_ - 100, ox + 42, hy_ - 62), fill=dark)
+    for i, col in enumerate(((230, 70, 70, 255), (90, 210, 120, 255), (250, 210, 80, 255))):
+        d.ellipse(E(ox + 12 + i * 10, hy_ - 90, ox + 18 + i * 10, hy_ - 84), fill=col)
+    d.ellipse(E(ox - 30, hy_ - 152, ox + 44, hy_ - 126), fill=gray)
+    d.ellipse(E(ox - 46, hy_ - 242, ox + 66, hy_ - 130), fill=suit, outline=suit_d)
+    d.ellipse(E(ox + 4, hy_ - 228, ox + 70, hy_ - 150), fill=(28, 34, 66, 255), outline=gray)
+    d.arc(E(ox + 12, hy_ - 218, ox + 58, hy_ - 166), 200, 290, fill=(140, 180, 235, 220), width=5 * S)
+    d.ellipse(E(ox + 44, hy_ - 196, ox + 58, hy_ - 182), fill=(255, 190, 100, 200))
+    arm(sh, near[0], near[1], suit)
+    return im.resize((w, h), Image.LANCZOS)
+
+
+def draw_astronaut(img, x, y, scale=1.0, pose="stand", phase=0.0, facing=1, t=0.0):
+    """Full-body astronaut. (x, y) = ground contact. pose: stand | walk | descend | wave | plant."""
+    _blit_char(img, _astronaut_layer(pose, phase, t), 160, 410, x, y, scale, facing)
+
+
+def draw_flag(img, x, y, scale=1.0, rise=1.0, color=(30, 60, 140)):
+    """Flag on a pole planted at ground point (x, y); rise 0..1 raises the pole then unfurls the flag."""
+    d = ImageDraw.Draw(img, "RGBA")
+    ph = 340 * scale * clamp(rise / 0.7)
+    top = y - ph
+    d.line([(x, y), (x, top)], fill=(215, 220, 232, 255), width=max(2, int(7 * scale)))
+    d.ellipse([x - 8 * scale, top - 8 * scale, x + 8 * scale, top + 8 * scale], fill=(240, 200, 80, 255))
+    u = clamp((rise - 0.7) / 0.3)
+    if u > 0.02:
+        fw, fh = 200 * scale * u, 124 * scale
+        d.line([(x, top + 8 * scale), (x + 200 * scale, top + 8 * scale)], fill=(215, 220, 232, 255), width=max(2, int(5 * scale)))
+        x0, y0 = x + 4 * scale, top + 10 * scale
+        d.rectangle([x0, y0, x0 + fw, y0 + fh], fill=color + (255,))
+        d.rectangle([x0, y0 + fh * 0.72, x0 + fw, y0 + fh * 0.86], fill=(255, 150, 50, 255))
+        cx, cy = x0 + fw * 0.3, y0 + fh * 0.36
+        pts = []
+        for k in range(10):
+            r = 24 * scale if k % 2 == 0 else 10 * scale
+            a = math.radians(-90 + 36 * k)
+            pts.append((cx + r * u * math.cos(a), cy + r * math.sin(a)))
+        d.polygon(pts, fill=(255, 255, 255, 255))
+        d.line([(x0 + fw, y0), (x0 + fw, y0 + fh)], fill=(0, 0, 0, 40), width=2)
 
 
 def run_cli(render_frame, total, default_out="out/video.mp4", description="2D animation"):
@@ -805,7 +912,7 @@ def preview(path, t=1.0):
     sheet = vgrad((6, 8, 20), (14, 18, 36))
     d = ImageDraw.Draw(sheet, "RGBA")
     f = get_font(28)
-    cw, ch = W // 2, H // 5
+    cw, ch = W // 2, H // 6
 
     def cell(i, label, fn):
         x0, y0 = (i % 2) * cw, (i // 2) * ch
@@ -826,6 +933,8 @@ def preview(path, t=1.0):
     cell(7, "draw_trophy", lambda x, y: draw_trophy(sheet, x, y, 0.9, t))
     cell(8, "draw_tortoise", lambda x, y: (ground(x, y + 70), draw_tortoise(sheet, x, y + 78, 0.8, 0.2, "walk", 1, t)))
     cell(9, "draw_hare", lambda x, y: (ground(x, y + 70), draw_hare(sheet, x, y + 78, 0.72, "stand", 0.0, 1, t)))
+    cell(10, "draw_astronaut", lambda x, y: (ground(x, y + 66), draw_astronaut(sheet, x, y + 70, 0.52, "wave", 0.0, 1, t)))
+    cell(11, "draw_flag", lambda x, y: (ground(x, y + 66), draw_flag(sheet, x - 40, y + 70, 0.5, 1.0)))
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     sheet.save(path)
     print("saved", path)
