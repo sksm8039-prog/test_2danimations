@@ -1,18 +1,28 @@
-name: Render test
+name: Render scene
 
-# Manual trigger only: no schedule, no push trigger, no secrets, no posting.
+# Manual trigger only: no schedule, no secrets, no posting.
+# Pick a scene from the list, then preview (a few PNG stills) or full (the mp4).
 on:
   workflow_dispatch:
     inputs:
+      scene:
+        description: "Which scene to render"
+        type: choice
+        options:
+          - scene_04_landing
+          - scene_03_ion_transfer
+          - mission_render2d
+          - tortoise_hare
+        default: scene_04_landing
       mode:
-        description: "preview = 5 PNG stills (about 1 min), full = 30 s mp4"
+        description: "preview = PNG stills (a minute or two), full = the mp4"
         type: choice
         options:
           - preview
           - full
         default: preview
       fps:
-        description: "Frame rate for full mode (15 = fast test, 30 = final)"
+        description: "Frame rate for full mode (15 = quick test, 30 = final)"
         type: choice
         options:
           - "15"
@@ -25,7 +35,7 @@ permissions:
 jobs:
   render:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
@@ -37,23 +47,32 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq ffmpeg
+          sudo apt-get install -y -qq ffmpeg fonts-dejavu-core
           pip install -r requirements.txt
 
       - name: Render
         shell: bash
         env:
+          SCENE: ${{ inputs.scene }}
           MODE: ${{ inputs.mode }}
           FPS: ${{ inputs.fps }}
         run: |
+          case "$SCENE" in
+            mission_render2d)      SCRIPT=render2d.py;               STILLS="3,12,19,26,31,38,50" ;;
+            scene_03_ion_transfer) SCRIPT=scene_03_ion_transfer.py;  STILLS="1,3,6,12,20,26,31" ;;
+            scene_04_landing)      SCRIPT=scene_04_landing.py;       STILLS="1,8,13,20,30,44,52" ;;
+            tortoise_hare)         SCRIPT=render_tortoise_hare.py;   STILLS="3,9,18,27,34" ;;
+            *) echo "::error::unknown scene $SCENE"; exit 1 ;;
+          esac
+          [ -f "$SCRIPT" ] || { echo "::error::$SCRIPT is not in the repo yet - upload it first"; exit 1; }
           mkdir -p out
           if [ "$MODE" = "preview" ]; then
-            python render2d.py --out out/preview.mp4 --still 2,8,14,20,26 | tee render.log
+            python "$SCRIPT" --out "out/$SCENE.mp4" --still "$STILLS" | tee render.log
           else
-            python render2d.py --out out/rocket_mission.mp4 --fps "$FPS" | tee render.log
+            python "$SCRIPT" --out "out/$SCENE.mp4" --fps "$FPS" | tee render.log
           fi
           {
-            echo "### Render log ($MODE)"
+            echo "### $SCENE ($MODE)"
             echo '```'
             tail -12 render.log
             echo '```'
@@ -61,7 +80,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: render2d-output
+          name: render-${{ inputs.scene }}-${{ inputs.mode }}
           path: out/
           if-no-files-found: error
           retention-days: 3
