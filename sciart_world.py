@@ -408,10 +408,12 @@ class Terrain:
                      sun_el=28.0, sun_az=55.0, amb=0.22, exposure=2.3, roll=1.2, ripples=0.028, rock=0.40),
     }
 
-    def __init__(self, kind="moon", size_m=80.0, tex=2048, seed=7, blast=None):
+    def __init__(self, kind="moon", size_m=80.0, tex=2048, seed=7, blast=None, over=None):
         import time
         t0 = time.time()
-        P = self.PRESETS[kind]
+        P = dict(self.PRESETS[kind])
+        P.update(over or {})
+        A = P.get("amp", 1.0)
         self.kind, self.P, self.n, self.size = kind, P, tex, size_m
         n, mpt = tex, size_m / tex
         self.mpt = mpt
@@ -421,7 +423,7 @@ class Terrain:
         def F(p0, octs, sd):
             return _norm01(fbm_p(ux, vy, p0, octs, seed + sd)).astype(np.float32)
 
-        h = (P["roll"] * (F(3, 4, 1) - 0.5) + 0.12 * (F(10, 4, 2) - 0.5) + 0.02 * (F(70, 4, 3) - 0.5)).astype(np.float32)
+        h = (P["roll"] * (F(3, 4, 1) - 0.5) + 0.12 * A * (F(10, 4, 2) - 0.5) + 0.02 * A * (F(70, 4, 3) - 0.5)).astype(np.float32)
         if P["ripples"]:
             h += P["ripples"] * np.sin(2 * np.pi * (73 * ux + 2.5 * F(6, 3, 8)))
         albm = np.ones((n, n), np.float32)
@@ -443,7 +445,8 @@ class Terrain:
             h[sub] += prof.astype(np.float32)
             albm[sub] *= (1 + 0.35 * fresh * np.exp(-((d - 1.25) / 0.55) ** 2) - 0.10 * np.clip(1 - d, 0, 1)).astype(np.float32)
         for _ in range(P["pebbles"]):
-            r = 0.025 + 0.22 * rng.random() ** 2.5
+            pr0, pr1 = P.get("peb", (0.025, 0.22))
+            r = pr0 + (pr1 - pr0) * rng.random() ** 2.5
             cy, cx = rng.integers(0, n, 2)
             rt = r / mpt
             w = int(rt) + 2
@@ -464,7 +467,7 @@ class Terrain:
             sub = np.ix_((cy + np.arange(-w, w + 1)) % n, (cx + np.arange(-w, w + 1)) % n)
             albm[sub] *= (1 - 0.32 * m * (0.5 + 0.5 * streak)).astype(np.float32)
             h[sub] -= (0.05 * m * (0.6 + 0.4 * streak)).astype(np.float32)
-        h += 0.004 * (F(300, 3, 21) - 0.5)
+        h += 0.004 * A * (F(300, 3, 21) - 0.5)
         # albedo: broad patches + fine regolith grain
         a = (1 + 0.45 * (F(6, 5, 30) - 0.5) + P["grain"] * (F(260, 2, 31) - 0.5) + 0.5 * P["grain"] * (F(900, 2, 32) - 0.5)) * albm
         base = np.array(P["base"], np.float32)
@@ -509,6 +512,23 @@ class Terrain:
         x1, y1 = (x0 + 1) % m, (y0 + 1) % m
         x0, y0 = x0 % m, y0 % m
         return T[y0, x0] * (1 - fx) * (1 - fy) + T[y0, x1] * fx * (1 - fy) + T[y1, x0] * (1 - fx) * fy + T[y1, x1] * fx * fy
+
+    def sample(self, E, N, g):
+        """Colours at site-frame metres (E, N) for a pixel footprint of g metres (mip-mapped, tiled)."""
+        U = (E + self.size / 2) / self.size * self.n
+        V = (N + self.size / 2) / self.size * self.n
+        top = len(self.mips) - 1
+        lvl = np.clip(np.log2(np.maximum(g / self.mpt, 1e-6)), 0, top - 0.001)
+        base = np.floor(lvl).astype(int)
+        out = np.empty((len(E), 3), np.float32)
+        for L in np.unique(base):
+            idx = np.nonzero(base == L)[0]
+            a = self._bilinear(L, U[idx], V[idx])
+            b = self._bilinear(min(L + 1, top), U[idx], V[idx])
+            f = (lvl[idx] - L)[:, None].astype(np.float32)
+            out[idx] = a * (1 - f) + b * f
+        return out
+
 
     def render_ground(self, img, cam, cam_x=0.0, cam_z=0.0, quality=0.5):
         """Paint the ground below the horizon into img (perspective-correct, mip-mapped)."""
@@ -691,7 +711,7 @@ def perspective_scene(planet_earth=None, t=0.0, terrain=None, seed=5):
 
 
 # ================================================================ ion tug
-def tug_layer(deploy, chem, ion, rng, angle, scale):
+def tug_layer(deploy, chem, ion, rng, angle, scale, legs=False):
     """The rocket with solar-panel wings and either a chemical flame (chem = flame length) or a blue ion beam
     (ion = 0..1). Rotates about the rocket centre, like sa.rocket_layer."""
     rig = Image.new("RGBA", (360, 1500), (0, 0, 0, 0))
@@ -705,7 +725,7 @@ def tug_layer(deploy, chem, ion, rng, angle, scale):
             fd.polygon([(180 - w * 0.5, 985), (180 + w * 0.5, 985), (180 + w * 0.1, 985 + L), (180 - w * 0.1, 985 + L)], fill=col)
         fd.ellipse([164, 976, 196, 1002], fill=(175, 215, 255, 255))
     rig.alpha_composite(fx.filter(ImageFilter.GaussianBlur(3)))
-    rig.alpha_composite(sa.ROCKET, (0, 470))
+    rig.alpha_composite(sa.ROCKET_LEGS if legs else sa.ROCKET, (0, 470))
     if deploy > 0.01:
         d = ImageDraw.Draw(rig, "RGBA")
         Lp = 190 * deploy
@@ -723,6 +743,109 @@ def tug_layer(deploy, chem, ion, rng, angle, scale):
     if abs(angle) > 0.05:
         rig = rig.rotate(-angle, resample=Image.BICUBIC, expand=True)
     return rig
+
+
+
+# ============================================================ lunar view
+class LunarView:
+    """Ray-traced Moon seen from any camera position, from orbit down to the dust.
+    Four terrain tiles (800 km, 40 km, 2 km, 160 m) plus a global texture blend by pixel footprint, so detail
+    appears continuously as the camera descends. Site frame: x east, y up at the landing site, z north, Moon centre
+    at the origin, landing site at (0, R, 0)."""
+
+    LODS = [
+        (800e3, 1024, dict(craters=420, rmin=3000.0, rmax=90e3, pebbles=0, roll=900.0, amp=800.0, grain=0.10)),
+        (40e3, 2048, dict(craters=420, rmin=40.0, rmax=4500.0, pebbles=0, roll=50.0, amp=40.0, grain=0.14)),
+        (2e3, 2048, dict(craters=420, rmin=1.5, rmax=140.0, pebbles=1800, peb=(0.4, 4.5), roll=3.0, amp=2.0)),
+        (160.0, 2048, dict(craters=300, rmin=0.35, rmax=16.0, pebbles=3500, peb=(0.04, 0.4), roll=0.5, amp=0.25)),
+    ]
+
+    def __init__(self, seed=11):
+        import time
+        t0 = time.time()
+        self.moon = Planet("moon")
+        self.tiles = []
+        for k, (size, tex, over) in enumerate(self.LODS):
+            blast = (size / 2, size / 2, 9.0) if k == 3 else None
+            self.tiles.append(Terrain("moon", size_m=size, tex=tex, seed=seed + k * 5, blast=blast, over=over))
+        self.sun = self.tiles[0].sun
+        ux = (np.arange(512, dtype=np.float32) / 512)[None, :]
+        vy = (np.arange(512, dtype=np.float32) / 512)[:, None]
+        self.grain = _norm01(fbm_p(ux, vy, 24, 4, 77)).astype(np.float32)
+        print(f"lunar view ready in {time.time() - t0:.1f}s")
+
+    @staticmethod
+    def _ss(x):
+        x = np.clip(x, 0, 1)
+        return x * x * (3 - 2 * x)
+
+    def render(self, cam, fwd, up_hint, f, W_=sa.W, H_=sa.H, cy=900.0, q=0.5):
+        """RGBA image of the Moon (alpha 0 = sky). cam = camera position in the site frame (metres)."""
+        R = R_MOON
+        Wq, Hq = int(W_ * q), int(H_ * q)
+        xs = (np.arange(Wq) + 0.5) / q
+        ys = (np.arange(Hq) + 0.5) / q
+        C = np.array(cam, np.float64)
+        fwd = np.array(fwd, np.float64)
+        fwd /= np.linalg.norm(fwd)
+        right = np.cross(np.array(up_hint, np.float64), fwd)
+        right /= np.linalg.norm(right)
+        up = np.cross(fwd, right)
+        dx = ((xs - W_ / 2) / f)[None, :]
+        dy = (-(ys - cy) / f)[:, None]
+        d = fwd[None, None, :] + right[None, None, :] * dx[..., None] + up[None, None, :] * dy[..., None]
+        d /= np.linalg.norm(d, axis=2, keepdims=True)
+        b = d @ C
+        disc = b * b - (C @ C - R * R)
+        hit = (disc > 0) & (b < 0)
+        t = np.where(hit, -b - np.sqrt(np.maximum(disc, 0)), 0.0)
+        P = C[None, None, :] + t[..., None] * d
+        n = P / R
+        cos_inc = np.clip(-(d * n).sum(2), 0.04, 1.0)
+        g = (t / f) / np.sqrt(cos_inc)
+        lat = np.arcsin(np.clip(n[..., 2], -1, 1))
+        lon = np.arctan2(n[..., 0], n[..., 1])
+        idx = np.nonzero(hit.ravel())[0]
+        out = np.zeros((Hq * Wq, 4), np.uint8)
+        if len(idx):
+            gl, latl, lonl = g.ravel()[idx], lat.ravel()[idx], lon.ravel()[idx]
+            E, N = R * lonl, R * latl
+            S = np.array(self.sun, np.float64)
+            lam = np.clip(n.reshape(-1, 3)[idx] @ S, 0, 1)
+            m = self.moon
+            nn = n.reshape(-1, 3)[idx]                           # global texture poles point east/west, away from the view
+            latg = np.arcsin(np.clip(nn[:, 0], -1, 1))
+            long_ = np.arctan2(nn[:, 2], nn[:, 1])
+            u = (long_ + np.pi) / (2 * np.pi) * m.tw - 0.5
+            v = np.clip((np.pi / 2 - latg) / np.pi * m.th - 0.5, 0, m.th - 1.001)
+            alb = m._sample(m.tex["albedo"], u, v).mean(-1)
+            Pm = Terrain.PRESETS["moon"]
+            lit = Pm["amb"] + Pm["exposure"] * lam
+            gcol = 1 - np.exp(-1.35 * (alb * 0.42 * lit)[:, None] * np.array(Pm["base"], np.float32)[None, :] / 0.30)
+            col = np.zeros((len(idx), 3), np.float32)
+            wrem = np.ones(len(idx), np.float32)
+            for k in (3, 2, 1, 0):                              # finest first
+                tile = self.tiles[k]
+                uk = self._ss((tile.size / np.maximum(gl, 1e-6) - 250.0) / 350.0) * (1 - self._ss((np.abs(latl) - 0.9) / 0.35))
+                if k == 3:
+                    uk = uk * (1 - self._ss((np.hypot(E, N) - 55.0) / 25.0))
+                wk = (uk * wrem).astype(np.float32)
+                sel = np.nonzero(wk > 0.003)[0]
+                if len(sel):
+                    c = tile.sample(E[sel], N[sel], gl[sel])
+                    col[sel] += wk[sel, None] * c
+                wrem = wrem * (1 - uk).astype(np.float32)
+            col += wrem[:, None] * gcol.astype(np.float32)
+            near = np.nonzero(gl < 0.35)[0]
+            if len(near):                                       # moon-sand grain close to the camera
+                gu = (E[near] / 10.0 % 1.0) * 512
+                gv = (N[near] / 10.0 % 1.0) * 512
+                gr = self.grain[gv.astype(int) % 512, gu.astype(int) % 512]
+                col[near] *= (1 + 0.20 * (gr - 0.5) * np.clip(1 - gl[near] / 0.35, 0, 1))[:, None]
+            out[idx, :3] = (np.clip(col, 0, 1) * 255).astype(np.uint8)
+            out[idx, 3] = 255
+        im = Image.fromarray(out.reshape(Hq, Wq, 4), "RGBA")
+        return im.resize((W_, H_), Image.BILINEAR) if q != 1 else im
 
 
 # ===================================================================== demos
