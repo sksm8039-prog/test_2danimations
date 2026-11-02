@@ -1,346 +1,889 @@
 #!/usr/bin/env python3
 """
-mission_sim.py - continuous-thrust flight physics for the Earth -> Moon mission
+sciart_world.py - realistic bodies, perspective view and physics timing for sciart
 
-Ion thrusters give a tiny, steady push (never a big burn), so the ship does not 'fire and coast'.
-It spirals outward around Earth over months, then spirals inward around the Moon.
-Every number here comes from integrating real two-body gravity with a small thrust along (or against) the velocity,
-so the flame/beam, the orbit shape, the speed and the clock all agree with each other.
+  Planet(kind).render(radius, rot, tilt, light)   rotating, lit, textured spheres
+                                                  kinds: earth | moon | mars | jupiter
+  GroundCamera                                    perspective ground plane (depth, foreshortening)
+  physics helpers                                 fall_time, hop_time, orbit_period, Units ...
 
-  python mission_sim.py                 # prints the mission report
-  python mission_sim.py --plot out.png  # draws both spirals
+  python sciart_world.py --demo out/world      # writes planets.png and perspective.png
 """
 from __future__ import annotations
 
 import argparse
 import math
+import random
+from pathlib import Path
 
 import numpy as np
+from PIL import Image, ImageDraw, ImageFilter
 
-MU_EARTH, MU_MOON = 3.986004e14, 4.9028e12
-R_EARTH, R_MOON = 6.371e6, 1.7374e6
-D_MOON = 3.844e8            # Earth-Moon distance, m
-DAY = 86400.0
+import sciart as sa
+from sciart import clamp, lerp, smooth
 
-
-def _acc(mu, p, v, a_thr, sign):
-    r = math.hypot(p[0], p[1])
-    vn = math.hypot(v[0], v[1])
-    g = -mu / r ** 3
-    t = sign * a_thr / vn
-    return (g * p[0] + t * v[0], g * p[1] + t * v[1])
+# =================================================================== physics
+G_EARTH, G_MOON = 9.81, 1.62                 # m/s^2
+MU_EARTH, MU_MOON = 3.986004e14, 4.9028e12   # gravitational parameters, m^3/s^2
+R_EARTH, R_MOON = 6.371e6, 1.7374e6          # mean radii, m
 
 
-def spiral(mu, r0, r1, a_thr, outward=True, steps_per_orbit=360):
-    """Integrate a constant-acceleration low-thrust spiral between circular radii r0 and r1.
-    Returns dict of arrays: t (s), r (m), theta (rad, unwrapped), v (m/s)."""
-    sign = 1.0 if outward else -1.0
-    p, v = [r0, 0.0], [0.0, math.sqrt(mu / r0)]
-    t, th = 0.0, 0.0
-    T, R, TH, V = [0.0], [r0], [0.0], [v[1]]
-    prev = math.atan2(p[1], p[0])
-    while True:
-        r = math.hypot(*p)
-        if (outward and r >= r1) or (not outward and r <= r1) or t > 900 * DAY:
-            break
-        dt = 2 * math.pi * math.sqrt(r ** 3 / mu) / steps_per_orbit
-        k1p, k1v = v, _acc(mu, p, v, a_thr, sign)
-        p2 = [p[i] + 0.5 * dt * k1p[i] for i in range(2)]
-        v2 = [v[i] + 0.5 * dt * k1v[i] for i in range(2)]
-        k2p, k2v = v2, _acc(mu, p2, v2, a_thr, sign)
-        p3 = [p[i] + 0.5 * dt * k2p[i] for i in range(2)]
-        v3 = [v[i] + 0.5 * dt * k2v[i] for i in range(2)]
-        k3p, k3v = v3, _acc(mu, p3, v3, a_thr, sign)
-        p4 = [p[i] + dt * k3p[i] for i in range(2)]
-        v4 = [v[i] + dt * k3v[i] for i in range(2)]
-        k4p, k4v = v4, _acc(mu, p4, v4, a_thr, sign)
-        p = [p[i] + dt / 6 * (k1p[i] + 2 * k2p[i] + 2 * k3p[i] + k4p[i]) for i in range(2)]
-        v = [v[i] + dt / 6 * (k1v[i] + 2 * k2v[i] + 2 * k3v[i] + k4v[i]) for i in range(2)]
-        t += dt
-        ang = math.atan2(p[1], p[0])
-        d = ang - prev
-        if d < -math.pi:
-            d += 2 * math.pi
-        elif d > math.pi:
-            d -= 2 * math.pi
-        th += d
-        prev = ang
-        T.append(t)
-        R.append(math.hypot(*p))
-        TH.append(th)
-        V.append(math.hypot(*v))
-    return {"t": np.array(T), "r": np.array(R), "theta": np.array(TH), "v": np.array(V)}
+def fall_time(height_m, g):
+    """Seconds for something dropped from rest to fall height_m."""
+    return math.sqrt(2 * height_m / g)
 
 
-def propagate(mu, p, v, t, accel, stop, steps_per_orbit=360, dt_cap=None):
-    """RK4 two-body integrator. accel(t,p,v) -> (ax, ay, thrust_magnitude). Returns records and final state."""
-    rec = []
-    p, v = list(p), list(v)
-
-    def rhs(p_, v_, t_):
-        g = -mu / math.hypot(*p_) ** 3
-        ax, ay, thr = accel(t_, p_, v_)
-        return v_, (g * p_[0] + ax, g * p_[1] + ay), thr
-
-    for _ in range(3000000):
-        r = math.hypot(*p)
-        dt = 2 * math.pi * math.sqrt(r ** 3 / mu) / steps_per_orbit
-        if dt_cap:
-            dt = min(dt, dt_cap)
-        k1p, k1v, thr = rhs(p, v, t)
-        rec.append((t, p[0], p[1], v[0], v[1], thr))
-        if stop(t, p, v):
-            break
-        p2 = [p[i] + 0.5 * dt * k1p[i] for i in range(2)]
-        v2 = [v[i] + 0.5 * dt * k1v[i] for i in range(2)]
-        k2p, k2v, _ = rhs(p2, v2, t + dt / 2)
-        p3 = [p[i] + 0.5 * dt * k2p[i] for i in range(2)]
-        v3 = [v[i] + 0.5 * dt * k2v[i] for i in range(2)]
-        k3p, k3v, _ = rhs(p3, v3, t + dt / 2)
-        p4 = [p[i] + dt * k3p[i] for i in range(2)]
-        v4 = [v[i] + dt * k3v[i] for i in range(2)]
-        k4p, k4v, _ = rhs(p4, v4, t + dt)
-        p = [p[i] + dt / 6 * (k1p[i] + 2 * k2p[i] + 2 * k3p[i] + k4p[i]) for i in range(2)]
-        v = [v[i] + dt / 6 * (k1v[i] + 2 * k2v[i] + 2 * k3v[i] + k4v[i]) for i in range(2)]
-        t += dt
-    return rec, (t, p, v)
+def fall_speed(height_m, g):
+    return math.sqrt(2 * g * height_m)
 
 
-def _prograde(a):
-    def f(t, p, v):
-        n = math.hypot(*v)
-        return a * v[0] / n, a * v[1] / n, a
-    return f
+def hop_time(v0, g):
+    """Seconds in the air for a jump leaving the ground at v0 m/s."""
+    return 2 * v0 / g
 
 
-def _retro(a):
-    def f(t, p, v):
-        n = math.hypot(*v)
-        return -a * v[0] / n, -a * v[1] / n, a
-    return f
+def orbit_period(r_m, mu):
+    """Circular orbit period at distance r_m from the centre (Kepler)."""
+    return 2 * math.pi * math.sqrt(r_m ** 3 / mu)
 
 
-def _coast(t, p, v):
-    return 0.0, 0.0, 0.0
+def circular_speed(r_m, mu):
+    return math.sqrt(mu / r_m)
 
 
-def build_mission(a_ion=5e-4, a_chem=10.0, leo_alt=400e3, geo=42164e3, moon_gap=30000e3):
-    """One continuous flight, Earth frame then Moon frame, as arrays.
-    stages: 0 LEO lap, 1 chemical burn (raise), 2 coast to apogee, 3 chemical burn (circularise),
-            4 ion spiral out, 5 ion spiral in around the Moon."""
-    r1 = R_EARTH + leo_alt
-    mu = MU_EARTH
-    a_tr = (r1 + geo) / 2
-    eps = lambda p, v: 0.5 * (v[0] ** 2 + v[1] ** 2) - mu / math.hypot(*p)
-    T1 = 2 * math.pi * math.sqrt(r1 ** 3 / mu)
-    pieces, state = [], ([r1, 0.0], [0.0, math.sqrt(mu / r1)], 0.0)
+class Units:
+    """Connects metres and seconds to pixels and screen seconds for one scene.
 
-    def run(stage, mu_, accel, stop, **kw):
-        nonlocal state
-        p, v, t = state
-        rec, (t, p, v) = propagate(mu_, p, v, t, accel, stop, **kw)
-        pieces.append((stage, rec[1:] if pieces else rec))
-        state = (p, v, t)
+    px_per_m   : how many pixels one metre is at the scene's main distance
+    time_scale : real seconds per screen second (1 = real time, 60 = a minute per second)
+    """
 
-    run(0, mu, _coast, lambda t, p, v: t >= T1)
-    run(1, mu, _prograde(a_chem), lambda t, p, v: eps(p, v) >= -mu / (2 * a_tr), dt_cap=4.0)
-    run(2, mu, _coast, lambda t, p, v: p[0] * v[0] + p[1] * v[1] <= 0)
-    run(3, mu, _prograde(a_chem), lambda t, p, v: eps(p, v) >= -mu / (2 * math.hypot(*p)), dt_cap=4.0)
-    r_apo = max(max(math.hypot(r[1], r[2]) for r in rec) for st, rec in pieces)
-    r_end = D_MOON - moon_gap
-    run(4, mu, _prograde(a_ion), lambda t, p, v: math.hypot(*p) >= r_end)
-    p_end, v_end, t_end = state
-    k = D_MOON / math.hypot(*p_end)
-    M = (p_end[0] * k, p_end[1] * k)                    # the Moon, radially outward of the ship
-    rel = (p_end[0] - M[0], p_end[1] - M[1])
-    rr = math.hypot(*rel)
-    vc = math.sqrt(MU_MOON / rr)
-    vrel = (-rel[1] / rr * vc, rel[0] / rr * vc)
-    state = (list(rel), list(vrel), t_end)
-    run(5, MU_MOON, _retro(a_ion), lambda t, p, v: math.hypot(*p) <= R_MOON + 100e3)
-    T, X, Y, VX, VY, THR, STG = [], [], [], [], [], [], []
-    for stage, rec in pieces:
-        for (t, x, y, vx, vy, thr) in rec:
-            T.append(t)
-            X.append(x + (M[0] if stage == 5 else 0.0))
-            Y.append(y + (M[1] if stage == 5 else 0.0))
-            VX.append(vx)
-            VY.append(vy)
-            THR.append(thr)
-            STG.append(stage)
-    T, X, Y = np.array(T), np.array(X), np.array(Y)
-    VX, VY, THR, STG = np.array(VX), np.array(VY), np.array(THR), np.array(STG)
-    # cumulative orbit angle: Earth frame for stages 0-4, Moon frame for stage 5
-    ang = np.where(STG <= 4, np.arctan2(Y, X), np.arctan2(Y - M[1], X - M[0]))
-    TH = np.zeros_like(T)
-    for i in range(1, len(T)):
-        d = ang[i] - ang[i - 1]
-        if STG[i] != STG[i - 1]:
-            d = 0.0
-        d = (d + math.pi) % (2 * math.pi) - math.pi
-        TH[i] = TH[i - 1] + d
-    TH[STG == 5] -= TH[STG == 5][0]
-    seg = {}
-    for st in range(6):
-        idx = np.nonzero(STG == st)[0]
-        seg[st] = (int(idx[0]), int(idx[-1]))
-    return {"T": T, "X": X, "Y": Y, "VX": VX, "VY": VY, "THR": THR, "STG": STG, "TH": TH, "seg": seg,
-            "M": M, "r1": r1, "r_apo": r_apo, "r_end": r_end, "t_arrive": float(T[seg[4][1]]),
-            "phi_arr": math.atan2(M[1], M[0]), "a_ion": a_ion, "a_chem": a_chem}
+    def __init__(self, px_per_m, time_scale=1.0):
+        self.px_per_m, self.time_scale = px_per_m, time_scale
+
+    def px(self, metres):
+        return metres * self.px_per_m
+
+    def accel_px(self, g):
+        """Gravity in px per screen-second squared."""
+        return g * self.px_per_m * self.time_scale ** 2
+
+    def screen_seconds(self, real_seconds):
+        return real_seconds / self.time_scale
 
 
-def _quintic(x0, v0, a0, x1, v1, a1, T):
-    """Quintic polynomial hitting position, velocity and acceleration at t=0 and t=T."""
-    c0, c1, c2 = x0, v0, a0 / 2
-    A = np.array([[T ** 3, T ** 4, T ** 5], [3 * T ** 2, 4 * T ** 3, 5 * T ** 4], [6 * T, 12 * T ** 2, 20 * T ** 3]])
-    b = np.array([x1 - (c0 + c1 * T + c2 * T ** 2), v1 - (c1 + 2 * c2 * T), a1 - 2 * c2])
-    c3, c4, c5 = np.linalg.solve(A, b)
-    return (c0, c1, c2, c3, c4, c5)
+# ===================================================================== noise
+def _hash(ix, iy, iz, seed):
+    h = (ix * np.uint32(374761393)) + (iy * np.uint32(668265263)) + (iz * np.uint32(2147483647)) \
+        + np.uint32((seed * 1013904223) % 4294967296)
+    h = (h ^ (h >> np.uint32(13))) * np.uint32(1274126177)
+    h = h ^ (h >> np.uint32(16))
+    return (h & np.uint32(0xFFFF)).astype(np.float32) / 65535.0
 
 
-def _poly(c, t):
-    t = np.asarray(t, float)
-    x = c[0] + c[1] * t + c[2] * t ** 2 + c[3] * t ** 3 + c[4] * t ** 4 + c[5] * t ** 5
-    v = c[1] + 2 * c[2] * t + 3 * c[3] * t ** 2 + 4 * c[4] * t ** 3 + 5 * c[5] * t ** 4
-    a = 2 * c[2] + 6 * c[3] * t + 12 * c[4] * t ** 2 + 20 * c[5] * t ** 3
-    return x, v, a
+def _vnoise(x, y, z, seed):
+    xf, yf, zf = np.floor(x), np.floor(y), np.floor(z)
+    fx, fy, fz = x - xf, y - yf, z - zf
+    fx, fy, fz = fx * fx * (3 - 2 * fx), fy * fy * (3 - 2 * fy), fz * fz * (3 - 2 * fz)
+    xi = (xf.astype(np.int64) & 0xFFFFFFFF).astype(np.uint32)
+    yi = (yf.astype(np.int64) & 0xFFFFFFFF).astype(np.uint32)
+    zi = (zf.astype(np.int64) & 0xFFFFFFFF).astype(np.uint32)
+    one = np.uint32(1)
+
+    def c(a, b, d):
+        return _hash(xi + a, yi + b, zi + d, seed)
+
+    x00 = c(0, 0, 0) + (c(one, 0, 0) - c(0, 0, 0)) * fx
+    x10 = c(0, one, 0) + (c(one, one, 0) - c(0, one, 0)) * fx
+    x01 = c(0, 0, one) + (c(one, 0, one) - c(0, 0, one)) * fx
+    x11 = c(0, one, one) + (c(one, one, one) - c(0, one, one)) * fx
+    y0 = x00 + (x10 - x00) * fy
+    y1 = x01 + (x11 - x01) * fy
+    return y0 + (y1 - y0) * fz
 
 
-def build_descent(alt0=100e3, alt_p=15e3, a_dorb=2.0, h_td=5.8, v_td=0.8, dt3=0.5):
-    """Lunar landing from a circular orbit, as one continuous flight in Moon-centred polar coordinates.
-    1 de-orbit burn (retro) -> 2 coast to periapsis -> 3 powered descent along a smooth path to the site.
-    The thrust is DERIVED from the path (accel - gravity), so the engine fires exactly as hard as the motion needs."""
-    mu, R = MU_MOON, R_MOON
-    r0, rp = R + alt0, R + alt_p
-    v_c = math.sqrt(mu / r0)
-    v_a = math.sqrt(2 * mu * rp / (r0 * (r0 + rp)))
-    p, v, t = [r0, 0.0], [0.0, v_c], 0.0
-    rec1, (t, p, v) = propagate(mu, p, v, t, _retro(a_dorb), lambda t, p, v: math.hypot(*v) <= v_a, dt_cap=0.5)
-    neg = [False]
+def fbm(x, y, z, octaves=6, seed=0, lac=2.0, gain=0.5):
+    total, amp, norm, f = 0.0, 1.0, 0.0, 1.0
+    for o in range(octaves):
+        total = total + amp * _vnoise(x * f, y * f, z * f, seed + o * 17)
+        norm += amp
+        amp *= gain
+        f *= lac
+    return total / norm
 
-    def stop2(t, p, v):
-        rv = p[0] * v[0] + p[1] * v[1]
-        neg[0] = neg[0] or rv < 0
-        return neg[0] and rv >= 0
 
-    rec2, (t, p, v) = propagate(mu, p, v, t, _coast, stop2, steps_per_orbit=720)
-    rows = []
-    for stg, rec in ((0, [(0.0, r0, 0.0, 0.0, v_c, 0.0)]), (1, rec1[1:]), (2, rec2[1:])):
-        for (tt, x, y, vx, vy, thr) in rec:
-            r = math.hypot(x, y)
-            vr, vth = (x * vx + y * vy) / r, (x * vy - y * vx) / r
-            sp = math.hypot(vx, vy)
-            sign = -1.0 if stg == 1 else 0.0
-            rows.append((tt, r, math.atan2(y, x), vr, vth, sign * thr * vr / sp, sign * thr * vth / sp, stg))
-    rows[0] = (0.0, r0, 0.0, 0.0, v_c, 0.0, 0.0, 1)
-    t_p, r_p, th_p, vr_p, vt_p = rows[-1][0], rows[-1][1], rows[-1][2], rows[-1][3], rows[-1][4]
-    om0 = vt_p / r_p
-    ar0 = vt_p ** 2 / r_p - mu / r_p ** 2
-    best = None
-    for T in range(420, 761, 20):
-        for k in np.linspace(0.20, 0.60, 41):
-            cr = _quintic(r_p, vr_p, ar0, R + h_td, -v_td, 0.0, T)
-            cth = _quintic(0.0, om0, 0.0, k * om0 * T, 0.0, 0.0, T)
-            ts = np.linspace(0, T, 400)
-            r, rd, rdd = _poly(cr, ts)
-            th, thd, thdd = _poly(cth, ts)
-            if (r < R + h_td - 0.5).any():
+def _norm01(a):
+    lo, hi = float(a.min()), float(a.max())
+    return (a - lo) / max(hi - lo, 1e-6)
+
+
+def _ss(a, e0, e1):
+    t = np.clip((a - e0) / (e1 - e0), 0, 1)
+    return t * t * (3 - 2 * t)
+
+
+def _mixc(c0, c1, t):
+    return np.array(c0, np.float32) / 255 * (1 - t[..., None]) + np.array(c1, np.float32) / 255 * t[..., None]
+
+
+def _sphere_grid(tw, th):
+    lon = (np.arange(tw, dtype=np.float32) + 0.5) / tw * 2 * np.pi - np.pi
+    lat = np.pi / 2 - (np.arange(th, dtype=np.float32) + 0.5) / th * np.pi
+    LON, LAT = np.meshgrid(lon, lat)
+    cl = np.cos(LAT)
+    return cl * np.cos(LON), np.sin(LAT), cl * np.sin(LON), LAT, LON
+
+
+# ================================================================== textures
+def _craters(X, Y, Z, g, n, seed, rim=0.22, depth=0.2, rmin=0.012, rmax=0.11):
+    rng = np.random.default_rng(seed)
+    for _ in range(n):
+        c = rng.normal(size=3)
+        c /= np.linalg.norm(c)
+        rho = rmin + (rmax - rmin) * rng.random() ** 3.5
+        d = X * c[0] + Y * c[1] + Z * c[2]
+        sel = d > math.cos(min(1.7 * rho, 3.0))
+        if not sel.any():
+            continue
+        ang = np.arccos(np.clip(d[sel], -1, 1))
+        v = g[sel]
+        inside = ang < rho
+        v = np.where(inside, v * ((1 - depth) + depth * 0.9 * (ang / rho)), v)
+        v = v + rim * np.exp(-((ang - rho) / (0.14 * rho)) ** 2) + 0.04 * np.exp(-((ang - 1.4 * rho) / (0.45 * rho)) ** 2)
+        g[sel] = v
+    return g
+
+
+def _tex_earth(tw, th, seed):
+    X, Y, Z, LAT, LON = _sphere_grid(tw, th)
+    h = _norm01(fbm(X * 1.9 + 11, Y * 1.9, Z * 1.9, 7, seed))
+    sea = float(np.quantile(h, 0.62))
+    land = _ss(h, sea - 0.004, sea + 0.004)
+    elev = np.clip((h - sea) / (1 - sea), 0, 1)
+    m = _norm01(fbm(X * 2.6 + 40, Y * 2.6, Z * 2.6 + 9, 5, seed + 7))
+    depth = np.clip((sea - h) / sea, 0, 1)
+    ocean = _mixc((34, 118, 178), (6, 26, 78), depth ** 0.6)
+    shelf = np.exp(-((h - (sea - 0.025)) / 0.03) ** 2)
+    ocean = ocean * (1 - 0.5 * shelf[..., None]) + np.array([52, 160, 176], np.float32) / 255 * 0.5 * shelf[..., None]
+    ground = _mixc((46, 108, 52), (112, 98, 66), np.clip(elev * 2.2, 0, 1))
+    forest = np.clip((m - 0.52) * 3, 0, 1) * (1 - elev)
+    ground = ground * (1 - 0.5 * forest[..., None]) + np.array([26, 78, 38], np.float32) / 255 * 0.5 * forest[..., None]
+    desert = _ss(0.46 - m, 0, 0.1) * (np.abs(LAT) < 0.75)
+    ground = ground * (1 - desert[..., None] * 0.85) + np.array([196, 168, 106], np.float32) / 255 * desert[..., None] * 0.85
+    peak = _ss(elev, 0.62, 0.9)
+    ground = ground * (1 - peak[..., None]) + np.array([214, 214, 218], np.float32) / 255 * peak[..., None]
+    alb = ocean * (1 - land[..., None]) + ground * land[..., None]
+    ice = _ss(np.abs(LAT) / (np.pi / 2) + 0.07 * (fbm(X * 6, Y * 6, Z * 6, 4, seed + 3) - 0.5), 0.80, 0.9)
+    alb = alb * (1 - ice[..., None]) + np.array([236, 243, 250], np.float32) / 255 * ice[..., None]
+    clouds = fbm(X * 3.2 + 70, Y * 5.5, Z * 3.2, 7, seed + 21)
+    clouds = np.clip((_norm01(clouds) - 0.52) * 3.2, 0, 1) ** 1.15
+    lights = np.clip((fbm(X * 14, Y * 14, Z * 14, 3, seed + 5) - 0.6) * 6, 0, 1) * land * (1 - ice) * (m > 0.38)
+    return {"albedo": alb.astype(np.float32), "ocean": ((1 - land) * (1 - ice)).astype(np.float32),
+            "clouds": clouds.astype(np.float32), "lights": lights.astype(np.float32)}
+
+
+def _tex_moon(tw, th, seed):
+    X, Y, Z, LAT, LON = _sphere_grid(tw, th)
+    g = 0.46 + 0.30 * _norm01(fbm(X * 3, Y * 3, Z * 3, 6, seed))
+    maria = _ss(_norm01(fbm(X * 2.2 + 5, Y * 2.2, Z * 2.2, 4, seed + 4)), 0.64, 0.72)
+    g = g * (1 - 0.30 * maria)
+    g = _craters(X, Y, Z, g, 190, seed + 9)
+    alb = np.stack([g * 1.0, g * 0.99, g * 0.96], -1)
+    return {"albedo": np.clip(alb, 0, 1).astype(np.float32)}
+
+
+def _tex_mars(tw, th, seed):
+    X, Y, Z, LAT, LON = _sphere_grid(tw, th)
+    base = _norm01(fbm(X * 2.2, Y * 2.2, Z * 2.2, 6, seed))
+    dark = _ss(_norm01(fbm(X * 1.6 + 9, Y * 1.6, Z * 1.6, 4, seed + 5)), 0.52, 0.62)
+    dust = _ss(_norm01(fbm(X * 4 + 3, Y * 4, Z * 4, 5, seed + 11)), 0.45, 0.75)
+    alb = _mixc((168, 88, 50), (206, 140, 92), dust * 0.8 + base * 0.2)
+    alb = alb * (1 - 0.55 * dark[..., None]) + np.array([74, 44, 36], np.float32) / 255 * 0.55 * dark[..., None]
+    g = alb.mean(-1)
+    g2 = _craters(X, Y, Z, g.copy(), 70, seed + 13, rim=0.10, depth=0.16, rmax=0.08)
+    alb = alb * (g2 / np.maximum(g, 1e-3))[..., None]
+    cap = _ss(np.abs(LAT) - 1.36 + 0.05 * (fbm(X * 8, Y * 8, Z * 8, 3, seed + 2) - 0.5), 0, 0.08)
+    alb = alb * (1 - cap[..., None]) + np.array([240, 240, 245], np.float32) / 255 * cap[..., None]
+    return {"albedo": np.clip(alb, 0, 1).astype(np.float32)}
+
+
+def _tex_jupiter(tw, th, seed):
+    X, Y, Z, LAT, LON = _sphere_grid(tw, th)
+    warp = fbm(X * 3, Y * 1.2, Z * 3, 5, seed)
+    b = np.sin(LAT * 13 + 4.2 * (warp - 0.5)) * 0.5 + 0.5
+    b2 = np.sin(LAT * 31 + 6 * (warp - 0.5) + 1.3) * 0.5 + 0.5
+    pal = [(232, 214, 178), (200, 160, 112), (150, 98, 64), (214, 182, 140), (178, 100, 70)]
+    t = np.clip(b * 0.75 + b2 * 0.25, 0, 0.9999) * (len(pal) - 1)
+    i = np.floor(t).astype(int)
+    f = (t - i)[..., None]
+    pa = np.array(pal, np.float32) / 255
+    alb = pa[i] * (1 - f) + pa[np.minimum(i + 1, len(pal) - 1)] * f
+    streak = (fbm(X * 9, Y * 40, Z * 9, 4, seed + 6) - 0.5) * 0.35
+    alb = alb * (1 + streak[..., None])
+    dl = (((LON - 0.7) / 0.30) ** 2 + ((LAT + 0.42) / 0.13) ** 2)
+    spot = np.clip(1 - dl, 0, 1) ** 0.6
+    ring = np.exp(-((np.sqrt(dl) - 1.05) / 0.12) ** 2) * 0.35
+    alb = alb * (1 - spot[..., None]) + np.array([190, 82, 58], np.float32) / 255 * spot[..., None]
+    alb = alb + ring[..., None] * 0.35
+    return {"albedo": np.clip(alb, 0, 1).astype(np.float32)}
+
+
+_BUILDERS = {"earth": _tex_earth, "moon": _tex_moon, "mars": _tex_mars, "jupiter": _tex_jupiter}
+# kind -> (atmosphere rim strength, rim colour, halo strength)
+_ATMOS = {"earth": (1.0, (0.40, 0.62, 1.0), 0.9), "moon": (0.0, (1, 1, 1), 0.0),
+          "mars": (0.35, (0.85, 0.55, 0.40), 0.35), "jupiter": (0.30, (0.95, 0.82, 0.60), 0.30)}
+
+
+# =================================================================== planets
+class Planet:
+    """A textured, lit, rotating sphere rendered as an RGBA sprite."""
+
+    def __init__(self, kind="earth", tex=(1280, 640), seed=3):
+        self.kind, self.tw, self.th = kind, tex[0], tex[1]
+        self.tex = _BUILDERS[kind](tex[0], tex[1], seed)
+        self._geo = {}
+
+    def _geom(self, R, tilt, light):
+        key = (R, round(tilt, 2), tuple(round(v, 3) for v in light))
+        if key in self._geo:
+            return self._geo[key]
+        if len(self._geo) > 3:
+            self._geo.clear()
+        pad = int(R * 1.18) + 2
+        S = 2 * pad
+        yy, xx = np.mgrid[0:S, 0:S].astype(np.float32)
+        xx -= pad - 0.5
+        yy -= pad - 0.5
+        nx, ny = xx / R, yy / R
+        r2 = nx * nx + ny * ny
+        r = np.sqrt(r2)
+        inside = r2 <= 1.0
+        nz = np.sqrt(np.clip(1 - r2, 0, 1))
+        L = np.array(light, np.float32)
+        L /= np.linalg.norm(L)
+        lam = nx * L[0] + ny * L[1] + nz * L[2]
+        Hv = L + np.array([0, 0, 1], np.float32)
+        Hv /= np.linalg.norm(Hv)
+        spec = np.clip(nx * Hv[0] + ny * Hv[1] + nz * Hv[2], 0, 1)
+        a = math.radians(tilt)
+        c, s = math.cos(a), math.sin(a)
+        tx, ty = nx * c + ny * s, -nx * s + ny * c
+        idx = np.nonzero(inside.ravel())[0]
+        halo = np.nonzero((~inside & (r < 1.18)).ravel())[0]
+        rf, nxf, nyf = r.ravel(), nx.ravel(), ny.ravel()
+        lxy = max(math.hypot(L[0], L[1]), 1e-6)
+        hr = (rf[halo] - 1) / 0.18
+        dirdot = (nxf[halo] * L[0] + nyf[halo] * L[1]) / np.maximum(rf[halo], 1e-6) / lxy
+        g = {"S": S, "idx": idx, "halo": halo, "R": R,
+             "lat": np.arcsin(np.clip(-ty.ravel()[idx], -1, 1)), "lon0": np.arctan2(nz.ravel()[idx], tx.ravel()[idx]),
+             "nz": nz.ravel()[idx], "lam": lam.ravel()[idx], "spec": spec.ravel()[idx], "r": rf[idx],
+             "hr": hr, "hlit": 0.15 + 0.85 * np.clip(dirdot * 0.5 + 0.5, 0, 1) ** 1.3}
+        self._geo[key] = g
+        return g
+
+    def _sample(self, arr, u, v):
+        tw, th = self.tw, self.th
+        u0 = np.floor(u).astype(np.int64)
+        v0 = np.floor(v).astype(np.int64)
+        fu, fv = (u - u0).astype(np.float32), (v - v0).astype(np.float32)
+        u1 = (u0 + 1) % tw
+        u0 = u0 % tw
+        v0 = np.clip(v0, 0, th - 1)
+        v1 = np.clip(v0 + 1, 0, th - 1)
+        w00, w10, w01, w11 = (1 - fu) * (1 - fv), fu * (1 - fv), (1 - fu) * fv, fu * fv
+        if arr.ndim == 3:
+            w00, w10, w01, w11 = w00[:, None], w10[:, None], w01[:, None], w11[:, None]
+        return arr[v0, u0] * w00 + arr[v0, u1] * w10 + arr[v1, u0] * w01 + arr[v1, u1] * w11
+
+    def render(self, radius, rot=0.0, tilt=0.0, light=(-0.62, -0.30, 0.72), cloud_rot=None):
+        R = int(round(radius))
+        g = self._geom(R, tilt, light)
+        S, idx = g["S"], g["idx"]
+        cr = rot * 1.08 + 12 if cloud_rot is None else cloud_rot
+        lon = g["lon0"] + math.radians(rot)
+        u = (lon + np.pi) / (2 * np.pi) * self.tw - 0.5
+        v = np.clip((np.pi / 2 - g["lat"]) / np.pi * self.th - 0.5, 0, self.th - 1.001)
+        col = self._sample(self.tex["albedo"], u, v)
+        lam, nz = g["lam"], g["nz"]
+        lam_w = np.clip((lam + 0.08) / 1.08, 0, 1)
+        amb = 0.035
+        diff = amb + (1 - amb) * lam_w ** 0.9
+        col = col * diff[:, None]
+        if self.kind == "earth":
+            u_c = u + math.radians(cr - rot) / (2 * np.pi) * self.tw
+            cl = self._sample(self.tex["clouds"], u_c, v)
+            cs = self._sample(self.tex["clouds"], u_c - 0.006 * self.tw, v - 0.004 * self.th)
+            col = col * (1 - 0.30 * cs[:, None])
+            cloud_col = (amb + (1 - amb) * lam_w ** 0.8)[:, None] * 0.97
+            col = col * (1 - cl[:, None]) + cloud_col * cl[:, None]
+            ocean = self._sample(self.tex["ocean"], u, v)
+            sp = (g["spec"] ** 170) * ocean * (1 - cl) * 0.38 * (lam > 0)
+            col = col + sp[:, None] * np.array([1.0, 0.97, 0.9], np.float32)
+            ls = self._sample(self.tex["lights"], u, v) * (1 - np.clip(lam * 4 + 0.3, 0, 1)) * (1 - cl)
+            col = col + ls[:, None] * np.array([1.0, 0.78, 0.42], np.float32) * 0.5
+        if self.kind == "jupiter":
+            col = col * (0.55 + 0.45 * np.sqrt(nz))[:, None]
+        rim_amt, rim_col, halo_amt = _ATMOS[self.kind]
+        if rim_amt > 0:
+            atm = (1 - nz) ** 3.0 * (0.12 + 0.88 * np.clip(lam + 0.30, 0, 1)) * rim_amt
+            col = 1 - (1 - np.clip(col, 0, 1)) * (1 - atm[:, None] * np.array(rim_col, np.float32) * 1.1)
+        col = (np.clip(col, 0, 1) * 255).astype(np.uint8)
+        disc = np.zeros((S * S, 4), np.uint8)
+        disc[idx, :3] = col
+        disc[idx, 3] = (np.clip((1 - g["r"]) * g["R"], 0, 1) * 255).astype(np.uint8)
+        out = Image.fromarray(disc.reshape(S, S, 4), "RGBA")
+        if halo_amt > 0:
+            h = np.zeros((S * S, 4), np.uint8)
+            hid = g["halo"]
+            h[hid, 0], h[hid, 1], h[hid, 2] = [int(255 * c) for c in rim_col]
+            h[hid, 3] = (np.clip(np.exp(-g["hr"] * 3.4) * 0.85 * g["hlit"] * halo_amt, 0, 1) * 255).astype(np.uint8)
+            halo = Image.fromarray(h.reshape(S, S, 4), "RGBA")
+            halo.alpha_composite(out)
+            out = halo
+        return out
+
+
+# ============================================================== perspective
+class GroundCamera:
+    """Pinhole camera looking along a flat ground plane.
+
+    A point on the ground x metres right and z metres ahead lands at
+        screen_x = cx + f*x/z      screen_y = horizon + f*cam_h/z
+    so things shrink as 1/z, climb toward the horizon, and circles flatten to ellipses.
+    """
+
+    def __init__(self, w=sa.W, h=sa.H, horizon=0.56, f=900.0, cam_h=2.0):
+        self.w, self.h, self.f, self.cam_h = w, h, f, cam_h
+        self.cx, self.hy = w / 2, h * horizon
+
+    def project(self, x, z):
+        s = self.f / z
+        return self.cx + x * s, self.hy + self.cam_h * s, s     # s = pixels per metre at that depth
+
+    def visible_half_width(self, z):
+        return self.w / 2 / self.f * z
+
+
+# =============================================================== surfaces
+def _pnoise2(ux, vy, P, seed):
+    """Tileable 2D value noise: lattice wraps every P cells."""
+    x, y = ux * P, vy * P
+    xf, yf = np.floor(x), np.floor(y)
+    fx, fy = (x - xf).astype(np.float32), (y - yf).astype(np.float32)
+    fx, fy = fx * fx * (3 - 2 * fx), fy * fy * (3 - 2 * fy)
+    xi, xj = (xf.astype(np.int64) % P).astype(np.uint32), ((xf.astype(np.int64) + 1) % P).astype(np.uint32)
+    yi, yj = (yf.astype(np.int64) % P).astype(np.uint32), ((yf.astype(np.int64) + 1) % P).astype(np.uint32)
+    z0 = np.zeros((1, 1), np.uint32)
+    c00, c10 = _hash(xi, yi, z0, seed), _hash(xj, yi, z0, seed)
+    c01, c11 = _hash(xi, yj, z0, seed), _hash(xj, yj, z0, seed)
+    a = c00 + (c10 - c00) * fx
+    b = c01 + (c11 - c01) * fx
+    return a + (b - a) * fy
+
+
+def fbm_p(ux, vy, P0, octaves, seed, gain=0.5):
+    total, amp, norm = 0.0, 1.0, 0.0
+    for o in range(octaves):
+        total = total + amp * _pnoise2(ux, vy, P0 * (2 ** o), seed + o * 13)
+        norm += amp
+        amp *= gain
+    return total / norm
+
+
+def sun_vector(el_deg, az_deg):
+    """Unit vector pointing TOWARD the sun. x right, y up, z away from the camera.
+    az 0 = sun directly behind the camera, positive = swings round to the camera's left."""
+    el, az = math.radians(el_deg), math.radians(az_deg)
+    return (-math.sin(az) * math.cos(el), math.sin(el), -math.cos(az) * math.cos(el))
+
+
+class Terrain:
+    """A tileable patch of ground: height map -> craters, pebbles, regolith grain -> baked sunlight
+    (including cast shadows) -> mipmaps, seen through a GroundCamera in true perspective."""
+
+    PRESETS = {
+        "moon": dict(base=(0.30, 0.298, 0.288), grain=0.30, craters=380, rmin=0.22, rmax=8.0, pebbles=3200,
+                     sun_el=19.0, sun_az=58.0, amb=0.12, exposure=4.6, roll=0.35, ripples=0.0, rock=0.46),
+        "mars": dict(base=(0.50, 0.28, 0.17), grain=0.26, craters=110, rmin=0.25, rmax=9.0, pebbles=6000,
+                     sun_el=28.0, sun_az=55.0, amb=0.22, exposure=2.3, roll=1.2, ripples=0.028, rock=0.40),
+    }
+
+    def __init__(self, kind="moon", size_m=80.0, tex=2048, seed=7, blast=None, over=None):
+        import time
+        t0 = time.time()
+        P = dict(self.PRESETS[kind])
+        P.update(over or {})
+        A = P.get("amp", 1.0)
+        self.kind, self.P, self.n, self.size = kind, P, tex, size_m
+        n, mpt = tex, size_m / tex
+        self.mpt = mpt
+        ux = (np.arange(n, dtype=np.float32) / n)[None, :]
+        vy = (np.arange(n, dtype=np.float32) / n)[:, None]
+
+        def F(p0, octs, sd):
+            return _norm01(fbm_p(ux, vy, p0, octs, seed + sd)).astype(np.float32)
+
+        h = (P["roll"] * (F(3, 4, 1) - 0.5) + 0.12 * A * (F(10, 4, 2) - 0.5) + 0.02 * A * (F(70, 4, 3) - 0.5)).astype(np.float32)
+        if P["ripples"]:
+            h += P["ripples"] * np.sin(2 * np.pi * (73 * ux + 2.5 * F(6, 3, 8)))
+        albm = np.ones((n, n), np.float32)
+        rng = np.random.default_rng(seed)
+        for _ in range(P["craters"]):
+            r = P["rmin"] * (P["rmax"] / P["rmin"]) ** (rng.random() ** 1.9)
+            cy, cx = rng.integers(0, n, 2)
+            rt = r / mpt
+            w = int(2.6 * rt) + 2
+            if w > n // 2 - 2:
                 continue
-            tr, tth = rdd - r * thd ** 2 + mu / r ** 2, r * thdd + 2 * rd * thd
-            if (tr < -0.1).any():
-                continue
-            peak = float(np.max(np.hypot(tr, tth)))
-            if best is None or peak < best[0]:
-                best = (peak, T, k, cr, cth)
-    peak, T3, k3, cr, cth = best
-    ts = np.arange(0.0, T3 + 1e-9, dt3)
-    r, rd, rdd = _poly(cr, ts)
-    th, thd, thdd = _poly(cth, ts)
-    tr, tth = rdd - r * thd ** 2 + mu / r ** 2, r * thdd + 2 * rd * thd
-    th_unw = np.unwrap([row[2] for row in rows])
-    th_p_u = th_unw[-1]
-    for i in range(len(ts) - 1 if rows else len(ts)):
-        rows.append((t_p + ts[i], float(r[i]), th_p_u + float(th[i]), float(rd[i]), float(r[i] * thd[i]), float(tr[i]), float(tth[i]), 3))
-    rows.append((t_p + ts[-1], float(r[-1]), th_p_u + float(th[-1]), float(rd[-1]), float(r[-1] * thd[-1]), float(tr[-1]), float(tth[-1]), 3))
-    arr = np.array(rows)
-    arr[:len(th_unw), 2] = th_unw
-    out = {k_: arr[:, i] for i, k_ in enumerate(("T", "R", "TH", "VR", "VT", "TR", "TT", "STG"))}
-    out["STG"] = out["STG"].astype(int)
-    out["th_site"] = float(th_p_u + th[-1])
-    out["peak_thrust"], out["T_descent"], out["k"], out["t_pdi"] = peak, T3, k3, t_p
-    return out
+            dy, dx = np.mgrid[-w:w + 1, -w:w + 1].astype(np.float32)
+            d = np.sqrt(dx * dx + dy * dy) / rt
+            fresh = rng.random() ** 0.7
+            D = 0.10 * r * (0.6 + 0.5 * fresh)
+            prof = np.where(d < 1, -D * (1 - d * d), 0.0) + D * 0.40 * (0.4 + fresh) * np.exp(-((d - 1.0) / 0.34) ** 2) \
+                + D * 0.18 * np.exp(-((np.maximum(d, 1.0) - 1.0) / 0.9) ** 2)
+            sub = np.ix_((cy + np.arange(-w, w + 1)) % n, (cx + np.arange(-w, w + 1)) % n)
+            h[sub] += prof.astype(np.float32)
+            albm[sub] *= (1 + 0.35 * fresh * np.exp(-((d - 1.25) / 0.55) ** 2) - 0.10 * np.clip(1 - d, 0, 1)).astype(np.float32)
+        for _ in range(P["pebbles"]):
+            pr0, pr1 = P.get("peb", (0.025, 0.22))
+            r = pr0 + (pr1 - pr0) * rng.random() ** 2.5
+            cy, cx = rng.integers(0, n, 2)
+            rt = r / mpt
+            w = int(rt) + 2
+            dy, dx = np.mgrid[-w:w + 1, -w:w + 1].astype(np.float32)
+            d2 = (dx * dx + dy * dy) / (rt * rt)
+            sub = np.ix_((cy + np.arange(-w, w + 1)) % n, (cx + np.arange(-w, w + 1)) % n)
+            h[sub] += (0.8 * r * (0.7 + 0.6 * rng.random()) * np.sqrt(np.clip(1 - d2, 0, 1))).astype(np.float32)
+            albm[sub] *= np.where(d2 < 1, 1 + 0.25 * (rng.random() - 0.5), 1.0).astype(np.float32)
+        if blast:                                              # scoured, streaked soil under a landing engine
+            bx, bz, br = blast
+            cy, cx = int(bz / mpt) % n, int(bx / mpt) % n
+            w = int(br / mpt)
+            dy, dx = np.mgrid[-w:w + 1, -w:w + 1].astype(np.float32)
+            d = np.sqrt(dx * dx + dy * dy) / w
+            ang = np.arctan2(dy, dx)
+            streak = 0.5 + 0.5 * np.sin(ang * 23 + 4 * np.sin(ang * 7 + d * 6))
+            m = np.clip(1 - d, 0, 1) ** 0.7
+            sub = np.ix_((cy + np.arange(-w, w + 1)) % n, (cx + np.arange(-w, w + 1)) % n)
+            albm[sub] *= (1 - 0.32 * m * (0.5 + 0.5 * streak)).astype(np.float32)
+            h[sub] -= (0.05 * m * (0.6 + 0.4 * streak)).astype(np.float32)
+        h += 0.004 * A * (F(300, 3, 21) - 0.5)
+        # albedo: broad patches + fine regolith grain
+        a = (1 + 0.45 * (F(6, 5, 30) - 0.5) + P["grain"] * (F(260, 2, 31) - 0.5) + 0.5 * P["grain"] * (F(900, 2, 32) - 0.5)) * albm
+        base = np.array(P["base"], np.float32)
+        # lighting bake
+        gx = (np.roll(h, -1, 1) - np.roll(h, 1, 1)) / (2 * mpt)
+        gz = (np.roll(h, -1, 0) - np.roll(h, 1, 0)) / (2 * mpt)
+        inv = 1 / np.sqrt(gx * gx + 1 + gz * gz)
+        L = sun_vector(P["sun_el"], P["sun_az"])
+        lam = np.clip(-gx * inv * L[0] + inv * L[1] - gz * inv * L[2], 0, 1)
+        shadow = self._shadow(h, L, mpt)
+        lit = P["amb"] + P["exposure"] * lam * (1 - 0.68 * shadow)
+        col = a[..., None] * base * lit[..., None]
+        col = 1 - np.exp(-1.35 * col)
+        self.mips = [col.astype(np.float32)]
+        while self.mips[-1].shape[0] > 8:
+            m_ = self.mips[-1]
+            self.mips.append((m_[0::2, 0::2] + m_[1::2, 0::2] + m_[0::2, 1::2] + m_[1::2, 1::2]) / 4)
+        self.sun = L
+        self._cache = {}
+        print(f"terrain '{kind}' baked in {time.time() - t0:.1f}s")
+
+    @staticmethod
+    def _shadow(h, L, mpt):
+        dxz = np.array([L[0], L[2]], np.float32)
+        dxz /= np.linalg.norm(dxz)
+        tan_el = L[1] / math.hypot(L[0], L[2])
+        occ = np.zeros(h.shape, bool)
+        for k in sorted({int(1.12 ** i) for i in range(0, 50)} | set(range(1, 9))):
+            hk = np.roll(h, (-int(round(dxz[1] * k)), -int(round(dxz[0] * k))), (0, 1))
+            occ |= hk > h + k * mpt * tan_el
+        s = occ.astype(np.float32)
+        for _ in range(24):
+            s = (s + np.roll(s, 1, 0) + np.roll(s, -1, 0) + np.roll(s, 1, 1) + np.roll(s, -1, 1)) / 5
+        return s
+
+    def _bilinear(self, lvl, U, V):
+        T = self.mips[lvl]
+        m, s = T.shape[0], 1.0 / (2 ** lvl)
+        x, y = U * s - 0.5, V * s - 0.5
+        x0, y0 = np.floor(x).astype(np.int64), np.floor(y).astype(np.int64)
+        fx, fy = (x - x0)[..., None].astype(np.float32), (y - y0)[..., None].astype(np.float32)
+        x1, y1 = (x0 + 1) % m, (y0 + 1) % m
+        x0, y0 = x0 % m, y0 % m
+        return T[y0, x0] * (1 - fx) * (1 - fy) + T[y0, x1] * fx * (1 - fy) + T[y1, x0] * (1 - fx) * fy + T[y1, x1] * fx * fy
+
+    def sample(self, E, N, g):
+        """Colours at site-frame metres (E, N) for a pixel footprint of g metres (mip-mapped, tiled)."""
+        U = (E + self.size / 2) / self.size * self.n
+        V = (N + self.size / 2) / self.size * self.n
+        top = len(self.mips) - 1
+        lvl = np.clip(np.log2(np.maximum(g / self.mpt, 1e-6)), 0, top - 0.001)
+        base = np.floor(lvl).astype(int)
+        out = np.empty((len(E), 3), np.float32)
+        for L in np.unique(base):
+            idx = np.nonzero(base == L)[0]
+            a = self._bilinear(L, U[idx], V[idx])
+            b = self._bilinear(min(L + 1, top), U[idx], V[idx])
+            f = (lvl[idx] - L)[:, None].astype(np.float32)
+            out[idx] = a * (1 - f) + b * f
+        return out
 
 
-def build_ascent(leo_alt=400e3, h0=35.0, twr0=1.25, dt=0.5):
-    """Pad to low Earth orbit as one continuous flight in Earth-centred polar coordinates.
-    The path is a smooth curve that starts at rest on the pad (thrust-to-weight twr0) and ends in a circular orbit
-    with the engine throttled smoothly to zero; the thrust is DERIVED from the path (accel - gravity)."""
-    mu, R, g0 = MU_EARTH, R_EARTH, 9.80665
-    r0, r1 = R + h0, R + leo_alt
-    vc = math.sqrt(mu / r1)
-    om1 = vc / r1
-    best = None
-    for T in range(500, 621, 20):
-        for th1 in np.linspace(0.10, 0.50, 41):
-            cr = _quintic(r0, 0.0, (twr0 - 1.0) * g0, r1, 0.0, 0.0, T)
-            cth = _quintic(0.0, 0.0, 0.0, th1, om1, 0.0, T)
-            ts = np.linspace(0, T, 500)
-            r, rd, rdd = _poly(cr, ts)
-            th, thd, thdd = _poly(cth, ts)
-            if (np.diff(r) < -1e-6).any() or (r < r0 - 1).any() or (rd < -1.0).any():
-                continue
-            tr, tth = rdd - r * thd ** 2 + mu / r ** 2, r * thdd + 2 * rd * thd
-            if (tr < 0.3 * g0).any() and False:
-                continue
-            mag = np.hypot(tr, tth)
-            if (mag[:int(0.88 * len(mag))] < 1.1 * g0).any():   # out-push gravity until the final throttle-down
-                continue
-            peak = float(mag.max())
-            if best is None or peak < best[0]:
-                best = (peak, T, th1, cr, cth)
-    if best is None:
-        raise RuntimeError("no feasible ascent found")
-    peak, T, th1, cr, cth = best
-    ts = np.arange(0.0, T + 1e-9, dt)
-    r, rd, rdd = _poly(cr, ts)
-    th, thd, thdd = _poly(cth, ts)
-    tr, tth = rdd - r * thd ** 2 + mu / r ** 2, r * thdd + 2 * rd * thd
-    return {"T": ts, "R": r, "TH": th, "VR": rd, "VT": r * thd, "TR": tr, "TT": tth, "peak": peak / g0,
-            "T_asc": float(T), "th_ins": float(th1), "r1": r1}
+    def render_ground(self, img, cam, cam_x=0.0, cam_z=0.0, quality=0.5):
+        """Paint the ground below the horizon into img (perspective-correct, mip-mapped)."""
+        key = (round(cam_x, 3), round(cam_z, 3), cam.f, cam.cam_h, cam.hy, img.width, img.height, quality)
+        if key not in self._cache:
+            self._cache = {key: self._render(img.width, img.height, cam, cam_x, cam_z, quality)}
+        hy, strip = self._cache[key]
+        img.paste(strip, (0, hy))
+
+    def _render(self, W_, H_, cam, cam_x, cam_z, q):
+        hy = int(math.ceil(cam.hy))
+        Wq, Rq = max(8, int(W_ * q)), max(8, int((H_ - hy) * q))
+        xs = (np.arange(Wq) + 0.5) / q
+        ys = hy + (np.arange(Rq) + 0.5) / q
+        z = cam.f * cam.cam_h / (ys - cam.hy)
+        X = cam_x + (xs[None, :] - cam.cx) / cam.f * z[:, None]
+        Zw = cam_z + np.broadcast_to(z[:, None], X.shape)
+        U, V = X / self.size * self.n, Zw / self.size * self.n
+        fx = (z / cam.f) / self.mpt / q
+        fz = (z * z / (cam.f * cam.cam_h)) / self.mpt / q
+        top = len(self.mips) - 1
+        lvl = np.clip(np.log2(np.maximum(np.maximum(fx, 0.6 * fz), 1e-6)), 0, top - 0.001)
+        out = np.zeros((Rq, Wq, 3), np.float32)
+        base = np.floor(lvl).astype(int)
+        for L in np.unique(base):
+            rows = np.nonzero(base == L)[0]
+            a = self._bilinear(L, U[rows], V[rows])
+            b = self._bilinear(min(L + 1, top), U[rows], V[rows])
+            f = (lvl[rows] - L)[:, None, None]
+            out[rows] = a * (1 - f) + b * f
+        im = Image.fromarray((np.clip(out, 0, 1) * 255).astype(np.uint8), "RGB")
+        if q != 1:
+            im = im.resize((W_, H_ - hy), Image.BILINEAR)
+        return hy, im
 
 
-def report(a_thr=5e-4, leo_alt=400e3, start="LEO"):
-    r0 = R_EARTH + leo_alt if start == "LEO" else 42164e3
-    up = spiral(MU_EARTH, r0, 0.985 * D_MOON, a_thr)
-    down = spiral(MU_MOON, 30000e3, R_MOON + 100e3, a_thr, outward=False)
-    return r0, up, down
+def _hull(points):
+    pts = sorted(set(points))
+    if len(pts) < 3:
+        return pts
+
+    def cross(o, a, b):
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    lo, up = [], []
+    for p in pts:
+        while len(lo) >= 2 and cross(lo[-2], lo[-1], p) <= 0:
+            lo.pop()
+        lo.append(p)
+    for p in reversed(pts):
+        while len(up) >= 2 and cross(up[-2], up[-1], p) <= 0:
+            up.pop()
+        up.append(p)
+    return lo[:-1] + up[:-1]
 
 
-def plot(path, up, down):
-    from PIL import Image, ImageDraw
-    img = Image.new("RGB", (1080, 540), (6, 8, 20))
-    d = ImageDraw.Draw(img)
-    for ox, data, rmax, label in ((270, up, D_MOON, "Earth spiral-out"), (810, down, 30000e3, "Moon spiral-in")):
-        pts = []
-        for r, th in zip(data["r"][::40], data["theta"][::40]):
-            pts.append((ox + 240 * r / rmax * math.cos(th), 270 + 240 * r / rmax * math.sin(th)))
-        d.line(pts, fill=(120, 200, 255), width=1)
-        d.text((ox - 120, 12), label, fill=(255, 255, 255))
-    img.save(path)
+def cast_shadow(img, cam, sun, x, z, radius, height, alpha=150):
+    """Shadow of an object (footprint circle of `radius` m, `height` m tall) projected on the ground in perspective."""
+    horiz = math.hypot(sun[0], sun[2])
+    length = height / max(sun[1] / horiz, 0.05)
+    sx_, sz_ = -sun[0] / horiz * length, -sun[2] / horiz * length
+    pts = []
+    for k in range(20):
+        a = 2 * math.pi * k / 20
+        for ox, oz in ((0.0, 0.0), (sx_, sz_)):
+            zz = z + math.sin(a) * radius + oz
+            if zz > 1.0:
+                px, py, _ = cam.project(x + math.cos(a) * radius + ox, zz)
+                pts.append((px, py))
+    if len(pts) >= 3:
+        ImageDraw.Draw(img, "RGBA").polygon(_hull(pts), fill=(5, 5, 9, alpha))
+
+
+def make_rock(seed, light, tone=0.38, N=220):
+    """A lit 3D-looking boulder sprite (faceted, grainy, dark underside). light is toward-sun in sprite space:
+    x right, y up, z toward the viewer."""
+    rng = np.random.default_rng(seed)
+    yy, xx = np.mgrid[0:N, 0:N].astype(np.float32)
+    u, v = (xx - N / 2) / (N / 2), (yy - N * 0.60) / (N / 2)
+    th = np.arctan2(v * 1.35, u)
+    harm = sum(a * np.sin(k * th + rng.uniform(0, 6.28)) for k, a in ((2, 0.10), (3, 0.08), (5, 0.05), (7, 0.03)))
+    rb = 0.80 * (1 + harm)
+    r = np.sqrt(u * u + (v * 1.35) ** 2)
+    z = np.sqrt(np.clip(1 - (r / rb) ** 2, 0, 1)) ** 0.8
+    one = np.ones_like(u)
+    n1 = fbm(u * 2.2 + seed, v * 2.2, one * (seed + 3.0), 4, seed)
+    n2 = 1 - np.abs(2 * fbm(u * 4.5 + 9, v * 4.5, one * (seed + 7.0), 3, seed + 5) - 1)
+    z = z * (0.78 + 0.5 * (n1 - 0.5)) + 0.14 * n2 * (z > 0.05)
+    d = 2.0 / N
+    zx, zy = np.gradient(z, d, axis=1) * 0.55, np.gradient(z, d, axis=0) * 0.55
+    nrm = np.sqrt(zx * zx + zy * zy + 1)
+    L = np.array(light, np.float32)
+    L /= np.linalg.norm(L)
+    lam = np.clip((-zx * L[0] + zy * L[1] + L[2]) / nrm, 0, 1)
+    grain = 0.82 + 0.36 * fbm(u * 26, v * 26, one * (seed + 11.0), 2, seed + 9)
+    ao = 1 - 0.5 * np.clip((v - 0.10) / 0.45, 0, 1) ** 1.6
+    shade = (0.10 + 1.15 * lam) * grain * ao
+    col = np.clip(tone * shade, 0, 1)[..., None] * np.array([1.0, 0.985, 0.96], np.float32)
+    col = 1 - np.exp(-1.35 * col)
+    alpha = np.clip((1 - r / rb) * N * 0.32, 0, 1)
+    arr = np.dstack([np.clip(col, 0, 1) * 255, alpha * 255]).astype(np.uint8)
+    im = Image.fromarray(arr, "RGBA")
+    return im.crop(im.getbbox())
+
+
+def place_rock(img, cam, sprite, x, z, width_m):
+    sx, sy, s = cam.project(x, z)
+    w = max(2, int(width_m * s))
+    h = max(2, int(w * sprite.height / sprite.width))
+    if sx + w < 0 or sx - w > img.width or sy - h > img.height:
+        return
+    spr = sprite.resize((w, h), Image.LANCZOS if w < sprite.width else Image.BILINEAR)
+    img.paste(spr, (int(sx - w / 2), int(sy - h * 0.92)), spr)
+
+
+def perspective_scene(planet_earth=None, t=0.0, terrain=None, seed=5):
+    """A lunar surface in true perspective: lit regolith, craters, boulders, footprints, lander, flag, astronaut."""
+    W_, H_ = sa.W, sa.H
+    cam = GroundCamera(W_, H_)
+    terrain = terrain or Terrain("moon", blast=(5.5, 52.0, 9.0))
+    sun = terrain.sun
+    light_sprite = (sun[0], sun[1], -sun[2])
+    img = sa.vgrad((1, 2, 8), (6, 7, 14), h=H_, w=W_)
+    sa.draw_stars(img, 1.0, t, ymax=int(cam.hy) - 30)
+    if planet_earth is not None:
+        sa.paste_center(img, planet_earth.render(150, rot=30 + t * 4, tilt=15, light=(0.55, -0.35, 0.75)), 780, 480)
+    rng = random.Random(seed)
+    # distant ridges, lit from the left
+    ridge = [(-20, cam.hy + 3)]
+    for x in range(-20, W_ + 60, 24):
+        ridge.append((x, cam.hy - 30 - 24 * math.sin(x * 0.011 + 1) - 14 * math.sin(x * 0.037) - rng.uniform(0, 5)))
+    ridge.append((W_ + 40, cam.hy + 3))
+    gm = Image.new("L", (W_, H_), 0)
+    ImageDraw.Draw(gm).polygon(ridge, fill=255)
+    img.paste(sa.vgrad((92, 92, 98), (34, 34, 40), h=H_, w=W_), (0, int(cam.hy) - 70 + 70 - 70), gm) if False else \
+        img.paste(Image.new("RGB", (W_, H_), (58, 58, 64)), (0, 0), gm)
+    d = ImageDraw.Draw(img, "RGBA")
+    for a, b in zip(ridge, ridge[1:]):
+        if b[1] > a[1]:
+            d.line([a, b], fill=(120, 120, 128, 150), width=3)          # sunlit left slopes
+    terrain.render_ground(img, cam)
+    d = ImageDraw.Draw(img, "RGBA")
+
+    sprites = [make_rock(s, light_sprite, terrain.P["rock"] * (0.75 + 0.5 * random.Random(s).random())) for s in range(1, 15)]
+    rocks = []
+    for _ in range(90):
+        z = 6 + rng.random() ** 1.7 * 170
+        rocks.append((z, rng.uniform(-0.68, 0.68) * z, rng.choice(sprites), rng.uniform(0.15, 0.7) * (1 + z / 60)))
+    for _ in range(18):
+        z = 3.5 + rng.random() * 8
+        rocks.append((z, rng.uniform(-0.6, 0.6) * z, rng.choice(sprites), rng.uniform(0.10, 0.4)))
+    rocks.sort(key=lambda r: -r[0])
+    for z, x, spr, wm in rocks:
+        cast_shadow(img, cam, sun, x, z, wm * 0.42, wm * 0.5, 120)
+        place_rock(img, cam, spr, x, z, wm)
+
+    for k in range(10):                                                  # boot prints, lit by the same sun
+        fx, fz = -1.9 - 0.72 * k, 7.0 + (0.17 if k % 2 else -0.17)
+        sx, sy, s = cam.project(fx, fz)
+        w, h = 0.30 * s, max(2.0, 0.12 * s * cam.cam_h / fz * 2.2)
+        d.ellipse([sx - w / 2, sy - h / 2, sx + w / 2, sy + h / 2], fill=(34, 34, 40, 150))
+        d.arc([sx - w / 2, sy - h / 2, sx + w / 2, sy + h / 2], 300, 80, fill=(210, 210, 216, 170), width=2)
+        d.arc([sx - w / 2, sy - h / 2, sx + w / 2, sy + h / 2], 110, 250, fill=(8, 8, 12, 190), width=3)
+
+    def place_h(z, x, height_m, sprite_px):
+        sx, sy, s = cam.project(x, z)
+        return sx, sy, (s * height_m) / sprite_px
+
+    sx, sy, sc = place_h(52, 5.5, 12.0, 520)
+    cast_shadow(img, cam, sun, 5.5, 52, 2.6, 11.0, 150)
+    sa.paste_center(img, sa.rocket_layer(sa.ROCKET_LEGS, 0, 1.4, random.Random(0), 0, sc), sx, sy - 250 * sc)
+    fx_, fy_, fsc = place_h(15, 3.2, 2.0, 340)
+    cast_shadow(img, cam, sun, 3.2, 15, 0.05, 2.0, 130)
+    sa.draw_flag(img, fx_, fy_, fsc, 1.0)
+    ax_, ay_, asc = place_h(7.0, -0.6, 1.8, 390)
+    cast_shadow(img, cam, sun, -0.6, 7.0, 0.3, 1.8, 150)
+    sa.draw_astronaut(img, ax_, ay_, asc, "walk", 0.18, 1, t)
+    return img
+
+
+
+# ================================================================ ion tug
+def tug_layer(deploy, chem, ion, rng, angle, scale, legs=False):
+    """The rocket with solar-panel wings and either a chemical flame (chem = flame length) or a blue ion beam
+    (ion = 0..1). Rotates about the rocket centre, like sa.rocket_layer."""
+    rig = Image.new("RGBA", (360, 1500), (0, 0, 0, 0))
+    fx = Image.new("RGBA", (360, 1500), (0, 0, 0, 0))
+    fd = ImageDraw.Draw(fx, "RGBA")
+    if chem > 2:
+        sa.draw_flame(fd, chem, 1.9, rng)
+    if ion > 0.02:
+        L = 340 * ion * (0.96 + 0.08 * rng.random())
+        for w, col in ((30, (110, 140, 255, 60)), (16, (150, 195, 255, 140)), (7, (235, 245, 255, 255))):
+            fd.polygon([(180 - w * 0.5, 985), (180 + w * 0.5, 985), (180 + w * 0.1, 985 + L), (180 - w * 0.1, 985 + L)], fill=col)
+        fd.ellipse([164, 976, 196, 1002], fill=(175, 215, 255, 255))
+    rig.alpha_composite(fx.filter(ImageFilter.GaussianBlur(3)))
+    rig.alpha_composite(sa.ROCKET_LEGS if legs else sa.ROCKET, (0, 470))
+    if deploy > 0.01:
+        d = ImageDraw.Draw(rig, "RGBA")
+        Lp = 190 * deploy
+        for sgn in (-1, 1):
+            x0, x1 = 180 + sgn * 65, 180 + sgn * (65 + Lp)
+            xa, xb = sorted((x0, x1))
+            d.line([(x0, 790), (x1, 790)], fill=(150, 156, 170, 255), width=4)
+            d.rectangle([xa, 735, xb, 845], fill=(24, 52, 120, 255), outline=(170, 180, 200, 255), width=2)
+            for k in range(1, max(2, int(Lp / 32))):
+                x = xa + (xb - xa) * k / max(2, int(Lp / 32))
+                d.line([(x, 735), (x, 845)], fill=(90, 130, 210, 255), width=1)
+            d.line([(xa, 790), (xb, 790)], fill=(90, 130, 210, 255), width=1)
+    if scale != 1:
+        rig = rig.resize((max(1, int(360 * scale)), max(1, int(1500 * scale))), Image.BILINEAR)
+    if abs(angle) > 0.05:
+        rig = rig.rotate(-angle, resample=Image.BICUBIC, expand=True)
+    return rig
+
+
+
+# ============================================================ lunar view
+class LunarView:
+    """Ray-traced Moon seen from any camera position, from orbit down to the dust.
+    Four terrain tiles (800 km, 40 km, 2 km, 160 m) plus a global texture blend by pixel footprint, so detail
+    appears continuously as the camera descends. Site frame: x east, y up at the landing site, z north, Moon centre
+    at the origin, landing site at (0, R, 0)."""
+
+    LODS = [
+        (800e3, 1024, dict(craters=420, rmin=3000.0, rmax=90e3, pebbles=0, roll=900.0, amp=800.0, grain=0.10)),
+        (40e3, 2048, dict(craters=420, rmin=40.0, rmax=4500.0, pebbles=0, roll=50.0, amp=40.0, grain=0.14)),
+        (2e3, 2048, dict(craters=420, rmin=1.5, rmax=140.0, pebbles=1800, peb=(0.4, 4.5), roll=3.0, amp=2.0)),
+        (160.0, 2048, dict(craters=300, rmin=0.35, rmax=16.0, pebbles=3500, peb=(0.04, 0.4), roll=0.5, amp=0.25)),
+    ]
+
+    def __init__(self, seed=11):
+        import time
+        t0 = time.time()
+        self.moon = Planet("moon")
+        self.tiles = []
+        for k, (size, tex, over) in enumerate(self.LODS):
+            blast = (size / 2, size / 2, 9.0) if k == 3 else None
+            self.tiles.append(Terrain("moon", size_m=size, tex=tex, seed=seed + k * 5, blast=blast, over=over))
+        self.sun = self.tiles[0].sun
+        ux = (np.arange(512, dtype=np.float32) / 512)[None, :]
+        vy = (np.arange(512, dtype=np.float32) / 512)[:, None]
+        self.grain = _norm01(fbm_p(ux, vy, 24, 4, 77)).astype(np.float32)
+        print(f"lunar view ready in {time.time() - t0:.1f}s")
+
+    @staticmethod
+    def _ss(x):
+        x = np.clip(x, 0, 1)
+        return x * x * (3 - 2 * x)
+
+    def render(self, cam, fwd, up_hint, f, W_=sa.W, H_=sa.H, cy=900.0, q=0.5):
+        """RGBA image of the Moon (alpha 0 = sky). cam = camera position in the site frame (metres)."""
+        R = R_MOON
+        Wq, Hq = int(W_ * q), int(H_ * q)
+        xs = (np.arange(Wq) + 0.5) / q
+        ys = (np.arange(Hq) + 0.5) / q
+        C = np.array(cam, np.float64)
+        fwd = np.array(fwd, np.float64)
+        fwd /= np.linalg.norm(fwd)
+        right = np.cross(np.array(up_hint, np.float64), fwd)
+        right /= np.linalg.norm(right)
+        up = np.cross(fwd, right)
+        dx = ((xs - W_ / 2) / f)[None, :]
+        dy = (-(ys - cy) / f)[:, None]
+        d = fwd[None, None, :] + right[None, None, :] * dx[..., None] + up[None, None, :] * dy[..., None]
+        d /= np.linalg.norm(d, axis=2, keepdims=True)
+        b = d @ C
+        disc = b * b - (C @ C - R * R)
+        hit = (disc > 0) & (b < 0)
+        t = np.where(hit, -b - np.sqrt(np.maximum(disc, 0)), 0.0)
+        P = C[None, None, :] + t[..., None] * d
+        n = P / R
+        cos_inc = np.clip(-(d * n).sum(2), 0.04, 1.0)
+        g = (t / f) / np.sqrt(cos_inc)
+        lat = np.arcsin(np.clip(n[..., 2], -1, 1))
+        lon = np.arctan2(n[..., 0], n[..., 1])
+        idx = np.nonzero(hit.ravel())[0]
+        out = np.zeros((Hq * Wq, 4), np.uint8)
+        if len(idx):
+            gl, latl, lonl = g.ravel()[idx], lat.ravel()[idx], lon.ravel()[idx]
+            E, N = R * lonl, R * latl
+            S = np.array(self.sun, np.float64)
+            lam = np.clip(n.reshape(-1, 3)[idx] @ S, 0, 1)
+            m = self.moon
+            nn = n.reshape(-1, 3)[idx]                           # global texture poles point east/west, away from the view
+            latg = np.arcsin(np.clip(nn[:, 0], -1, 1))
+            long_ = np.arctan2(nn[:, 2], nn[:, 1])
+            u = (long_ + np.pi) / (2 * np.pi) * m.tw - 0.5
+            v = np.clip((np.pi / 2 - latg) / np.pi * m.th - 0.5, 0, m.th - 1.001)
+            alb = m._sample(m.tex["albedo"], u, v).mean(-1)
+            Pm = Terrain.PRESETS["moon"]
+            lit = Pm["amb"] + Pm["exposure"] * lam
+            gcol = 1 - np.exp(-1.35 * (alb * 0.42 * lit)[:, None] * np.array(Pm["base"], np.float32)[None, :] / 0.30)
+            col = np.zeros((len(idx), 3), np.float32)
+            wrem = np.ones(len(idx), np.float32)
+            for k in (3, 2, 1, 0):                              # finest first
+                tile = self.tiles[k]
+                uk = self._ss((tile.size / np.maximum(gl, 1e-6) - 250.0) / 350.0) * (1 - self._ss((np.abs(latl) - 0.9) / 0.35))
+                if k == 3:
+                    uk = uk * (1 - self._ss((np.hypot(E, N) - 55.0) / 25.0))
+                wk = (uk * wrem).astype(np.float32)
+                sel = np.nonzero(wk > 0.003)[0]
+                if len(sel):
+                    c = tile.sample(E[sel], N[sel], gl[sel])
+                    col[sel] += wk[sel, None] * c
+                wrem = wrem * (1 - uk).astype(np.float32)
+            col += wrem[:, None] * gcol.astype(np.float32)
+            near = np.nonzero(gl < 0.35)[0]
+            if len(near):                                       # moon-sand grain close to the camera
+                gu = (E[near] / 10.0 % 1.0) * 512
+                gv = (N[near] / 10.0 % 1.0) * 512
+                gr = self.grain[gv.astype(int) % 512, gu.astype(int) % 512]
+                col[near] *= (1 + 0.20 * (gr - 0.5) * np.clip(1 - gl[near] / 0.35, 0, 1))[:, None]
+            out[idx, :3] = (np.clip(col, 0, 1) * 255).astype(np.uint8)
+            out[idx, 3] = 255
+        im = Image.fromarray(out.reshape(Hq, Wq, 4), "RGBA")
+        return im.resize((W_, H_), Image.BILINEAR) if q != 1 else im
+
+
+# ===================================================================== demos
+def demo_planets(path):
+    import time
+    t0 = time.time()
+    planets = {k: Planet(k) for k in ("earth", "moon", "mars", "jupiter")}
+    print(f"textures built in {time.time() - t0:.1f}s")
+    sheet = sa.vgrad((2, 3, 10), (8, 10, 22), h=1500, w=1080)
+    d = ImageDraw.Draw(sheet, "RGBA")
+    f = sa.get_font(30)
+    t1 = time.time()
+    cells = [("earth", 0, 23, (-0.62, -0.30, 0.72)), ("moon", 40, 0, (-0.62, -0.30, 0.72)),
+             ("mars", 70, 25, (-0.62, -0.30, 0.72)), ("jupiter", 10, 3, (-0.62, -0.30, 0.72))]
+    for i, (k, rot, tilt, light) in enumerate(cells):
+        x, y = 270 + (i % 2) * 540, 270 + (i // 2) * 540
+        sa.paste_center(sheet, planets[k].render(215, rot, tilt, light), x, y)
+        d.text((x - 250, y - 262), k, fill=(255, 255, 255, 200), font=f)
+    for i, (rot, light, lab) in enumerate(((0, (-0.62, -0.30, 0.72), "rotation 0"), (130, (-0.62, -0.30, 0.72), "rotation 130"),
+                                           (60, (0.95, 0.05, -0.2), "crescent"))):
+        x, y = 180 + i * 360, 1270
+        sa.paste_center(sheet, planets["earth"].render(150, rot, 23, light), x, y)
+        d.text((x - 120, y - 190), lab, fill=(255, 255, 255, 200), font=sa.get_font(26))
+    sheet.save(path)
+    print(f"rendered {path} in {time.time() - t1:.1f}s")
+    return planets
+
+
+def demo_perspective(path, planets=None):
+    earth = (planets or {}).get("earth") or Planet("earth")
+    perspective_scene(earth, 1.0).save(path)
+    print("saved", path)
 
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--plot", default="")
-    args = ap.parse_args()
-    for a_thr, label in ((2e-4, "SMART-1 class (70 mN, 370 kg)"), (5e-4, "bigger solar-electric tug"), (1.5e-3, "high-power future tug")):
-        for start in ("LEO", "GEO"):
-            r0, up, down = report(a_thr, start=start)
-            print(f"a={a_thr:.0e} m/s^2 [{label}] start {start}: "
-                  f"Earth spiral {up['t'][-1] / DAY:6.1f} d, {up['theta'][-1] / (2 * math.pi):6.1f} orbits | "
-                  f"Moon spiral {down['t'][-1] / DAY:5.1f} d, {abs(down['theta'][-1]) / (2 * math.pi):5.1f} orbits")
-    r0, up, down = report(5e-4, start="GEO")
-    # rate of orbit angle on screen if the whole Earth spiral is shown in 14 s with the radius growing on a log scale
-    print("GEO start, a=5e-4: speed at start/end (km/s):", round(up['v'][0] / 1e3, 2), round(up['v'][-1] / 1e3, 2))
-    if args.plot:
-        plot(args.plot, up, down)
+    ap = argparse.ArgumentParser(description="sciart_world demos")
+    ap.add_argument("--demo", default="out/world", help="output folder for planets.png and perspective.png")
+    out = Path(ap.parse_args().demo)
+    out.mkdir(parents=True, exist_ok=True)
+    pl = demo_planets(out / "planets.png")
+    demo_perspective(out / "perspective.png", pl)
